@@ -13,7 +13,8 @@ const LEAGUES = {
 const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Network", "TNT", "truTV", "NBA TV", "MLBN", "Netflix"];
 const TZ = "America/Chicago";
 const SETTINGS_KEY = "bananabets.settings";
-const DEFAULTS = { edgeThreshold: 5, kalshiProxy: "" };   // kalshiProxy: address of your Cloudflare Worker (worker/SETUP.md)
+// edgeThreshold: flag when the model and the sportsbook differ by this many points. 10 is what the backtest supports (see scripts/backtest_nfl.py).
+const DEFAULTS = { edgeThreshold: 10, kalshiProxy: "" };   // kalshiProxy: address of your Cloudflare Worker (worker/SETUP.md)
 
 const cache = new Map();                                    // url -> { at, data }; avoids duplicate requests
 async function getJSON(url, { maxAgeMs = 10000 } = {}) {
@@ -43,7 +44,7 @@ async function scoreboard(key, { week = false } = {}) {
   return [...seen.values()];
 }
 async function summary(key, id) {
-  return getJSON(`${ESPN}${LEAGUES[key].path}/summary?event=${encodeURIComponent(id)}`, { maxAgeMs: 8000 });
+  return getJSON(`${ESPN}${LEAGUES[key].path}/summary?event=${encodeURIComponent(id)}`, { maxAgeMs: 120000 });
 }
 
 function normalizeEvent(key, e) {
@@ -56,6 +57,7 @@ function normalizeEvent(key, e) {
     detail: type.shortDetail || type.detail || "", period: st.period || 0, clock: st.displayClock || "",
     playoff: !!e.season && e.season.type === 3,
     preseason: !!e.season && e.season.type === 1,
+    week: e.week ? e.week.number : null,
     broadcasts: (comp.broadcasts || []).flatMap((b) => b.names || []),
     headline: (comp.notes || []).map((n) => n.headline).filter(Boolean)[0] || "",
   };
@@ -72,15 +74,15 @@ function normalizeEvent(key, e) {
     away: normalizeTeam(away), home: normalizeTeam(home),
     odds: o && {
       provider: (o.provider && o.provider.name) || "",
-      spread: o.spread ?? null,                    // home team's spread (NFL, NBA)
+      spread: o.spread ?? null,                    // home team's spread (NFL, NBA); MLB uses the run line below
       total: o.overUnder ?? null,
       homeML: priceOf(o.moneyline && o.moneyline.home), awayML: priceOf(o.moneyline && o.moneyline.away),
       openHomeML: priceOf(o.moneyline && o.moneyline.home, "open"), openAwayML: priceOf(o.moneyline && o.moneyline.away, "open"),
-      openSpread: lineOf(o.pointSpread && o.pointSpread.home, "open"), openTotal: lineOf(o.total && o.total.over, "open"),
-      total_close: lineOf(o.total && o.total.over, "close"),
-      runline: key === "mlb" ? {
-        homeLine: lineOf(o.pointSpread && o.pointSpread.home, "close"), homeOdds: priceOf(o.pointSpread && o.pointSpread.home),
-      } : null,
+      homeSpreadPrice: priceOf(o.pointSpread && o.pointSpread.home), awaySpreadPrice: priceOf(o.pointSpread && o.pointSpread.away),
+      openSpread: lineOf(o.pointSpread && o.pointSpread.home, "open"), openHomeSpreadPrice: priceOf(o.pointSpread && o.pointSpread.home, "open"),
+      overPrice: priceOf(o.total && o.total.over), underPrice: priceOf(o.total && o.total.under),
+      openTotal: lineOf(o.total && o.total.over, "open"), openOverPrice: priceOf(o.total && o.total.over, "open"),
+      runline: key === "mlb" ? { homeLine: lineOf(o.pointSpread && o.pointSpread.home, "close") } : null,
     },
   };
 }
@@ -114,7 +116,7 @@ function normalizeFight(c) {
   return { id: c.id, a: side(f[0] || {}), b: side(f[1] || {}), state: c.status?.type?.state || "pre", detail: c.status?.type?.shortDetail || "", method: c.status?.type?.description || "", weight: c.type?.text || "" };
 }
 
-/* History files and the Kalshi proxy (both read-only) */
+/* History files, calibration numbers and the Kalshi proxy (all read-only) */
 const modelCache = {};
 async function loadHistory(key) {
   if (!modelCache[key]) {
@@ -124,6 +126,11 @@ async function loadHistory(key) {
     }).then((d) => ({ ...d, rows: d.games.map((g) => ({ date: g[0], home: g[1], away: g[2], hs: g[3], as: g[4], type: g[5], season: g[6] })) }));
   }
   return modelCache[key];
+}
+let calibrationCache = null;
+async function loadCalibration() {
+  if (!calibrationCache) calibrationCache = fetch("data/calibration.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  return calibrationCache;
 }
 const kalshiProxy = () => (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
 async function kalshiMarkets(key) {
@@ -151,6 +158,13 @@ function erf(x) {                                   // Abramowitz and Stegun 7.1
   return s * y;
 }
 const phi = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
+function impliedFromAmerican(a) { return a > 0 ? 100 / (a + 100) : -a / (-a + 100); }
+// Sportsbook probabilities with the bookmaker margin removed.
+function noVig2(a, b) {
+  if (a == null || b == null) return null;
+  const p = impliedFromAmerican(a), q = impliedFromAmerican(b), t = p + q;
+  return { first: p / t, second: q / t };
+}
 
 function isLive(ev) { return ev.state === "in"; }
 function isCloseLate(ev) {
@@ -165,7 +179,7 @@ function statusChip(ev) {
   if (ev.completed) return `<span class="chip final">Final</span>`;
   return `<span class="chip">${esc(fmtTime(ev.date))}</span>`;
 }
-// Logos: if one fails to load, the error handler below swaps in the team's abbreviation (after trying the dark-mode logo).
+// Logos: if one fails to load, the error handler swaps in the team's abbreviation (after trying the dark-mode logo).
 function logoHtml(team) {
   if (!team.logo) return `<span class="badge">${esc(team.abbr || "?")}</span>`;
   return `<img class="logo" src="${esc(team.logo)}" data-alt="${esc(team.logoAlt || "")}" data-abbr="${esc(team.abbr || "?")}" alt="" loading="lazy">`;
@@ -191,7 +205,7 @@ function teamCard(ev) {
   let lines = `<div class="muted" style="margin-top:8px">No pregame odds listed</div>`;
   if (o) {
     const spread = ev.league === "mlb" && o.runline
-      ? `Run line <b>${esc(h.abbr)} ${signedNum(o.runline.homeLine)}</b> <span class="muted">(${esc(american(o.runline.homeOdds))})</span>`
+      ? `Run line <b>${esc(h.abbr)} ${signedNum(o.runline.homeLine)}</b>`
       : `Spread <b>${esc(h.abbr)} ${signedNum(o.spread)}</b>`;
     lines = `<div class="lines"><span>${spread}</span><span>Total <b>${esc(o.total ?? "—")}</b></span>
       <span>ML <b>${esc(american(o.awayML))} / ${esc(american(o.homeML))}</b></span><span class="muted">${esc(o.provider)}</span></div>`;
@@ -308,27 +322,27 @@ function winChart(vals) {
     <polyline points="${pts}" fill="none" stroke="#c79a00" stroke-width="2.5"/></svg>`;
 }
 
-/* ---------- Predictions: power ratings from history, live update from the score ---------- */
-// Per league: how fast old games fade (half-life in days), how much to shrink small samples, and the spread of final margins.
+/* ---------- Predictions: power ratings from history, injuries, confidence, live update ---------- */
+// NFL settings come from scripts/backtest_nfl.py (walk-forward, tested on 2023-2025 seasons the grid never saw).
+// NBA settings are NOT calibrated yet (no historical odds to test against); they are placeholders.
 const MODEL = {
-  nfl: { halfLife: 180, shrink: 8, sigma: 13.5, totalSigma: 13.5, minGames: [4, 8] },
-  nba: { halfLife: 120, shrink: 12, sigma: 12.5, totalSigma: 15, minGames: [12, 30] },
+  nfl: { halfLife: 180, shrink: 4, sigma: 11.5, totalSigma: 13.5, qbEffect: -2.9, minGames: [4, 8], calibrated: true },
+  nba: { halfLife: 120, shrink: 12, sigma: 12.5, totalSigma: 15, qbEffect: 0, minGames: [12, 30], calibrated: false },
 };
 // Weighted points-for and points-against per team (recent games count more), turned into offense and defense ratings.
-// Output: expected points for each side, margin, total. Home-field advantage is the league's average home margin.
 function buildRatings(key, hist) {
   const cfg = MODEL[key];
   const asOf = todayKey();
   const current = Math.max(...hist.rows.map((r) => r.season));
   const teams = {};
   const T = (t) => (teams[t] ||= { w: 0, pf: 0, pa: 0, gp: 0 });
-  let sw = 0, sm = 0, hfaSum = 0, n = 0;
+  let sw = 0, sm = 0, hfaSum = 0, n = 0, seasonStart = null;
   for (const g of hist.rows) {
     if (g.date > asOf) continue;
     const w = Math.pow(0.5, daysBetween(g.date, asOf) / cfg.halfLife);
     const h = T(g.home), a = T(g.away);
     h.w += w; a.w += w; h.pf += w * g.hs; h.pa += w * g.as; a.pf += w * g.as; a.pa += w * g.hs;
-    if (g.season === current) { h.gp++; a.gp++; }
+    if (g.season === current) { h.gp++; a.gp++; if (!seasonStart || g.date < seasonStart) seasonStart = g.date; }
     sw += w; sm += w * (g.hs + g.as) / 2; hfaSum += w * (g.hs - g.as); n++;
   }
   const mu = sw ? sm / sw : 0, hfa = sw ? hfaSum / sw : 0;
@@ -336,31 +350,77 @@ function buildRatings(key, hist) {
     t.off = (t.pf - t.w * mu) / (t.w + cfg.shrink);
     t.def = (t.pa - t.w * mu) / (t.w + cfg.shrink);
   }
-  return { mu, hfa, teams, current, cfg, games: n };
+  return { mu, hfa, teams, current, cfg, games: n, seasonStart: seasonStart || asOf, weeksIntoSeason: seasonStart ? daysBetween(seasonStart, asOf) / 7 : 0 };
 }
 function h2hRows(hist, current, a, b) {
   return hist.rows.filter((g) => g.season >= current - 2 && ((g.home === a && g.away === b) || (g.home === b && g.away === a)));
 }
+// Injury status for each team's starting quarterback, from ESPN's current injury report.
+// Returns { [teamAbbr]: "out" | "questionable" } for QBs Out/Doubtful (out) or Questionable (questionable).
+async function qbStatuses(key, id) {
+  const s = await summary(key, id).catch(() => null);
+  const out = {};
+  for (const block of (s && s.injuries) || []) {
+    const abbr = (block.team && block.team.abbreviation) || "";
+    for (const i of block.injuries || []) {
+      const pos = i.athlete && i.athlete.position && i.athlete.position.abbreviation;
+      if (pos !== "QB") continue;
+      const st = String(i.status || "").toLowerCase();
+      if (st === "out" || st === "doubtful" || st === "injured reserve") out[abbr] = "out";
+      else if (st === "questionable" && out[abbr] !== "out") out[abbr] = "questionable";
+    }
+  }
+  return out;
+}
 // Pregame prediction for one upcoming game. Margin is from the home team's side.
-function predictGame(key, ratings, hist, ev) {
+function predictGame(key, ratings, hist, ev, qb) {
+  const cfg = ratings.cfg;
   const H = ratings.teams[ev.home.abbr] || { off: 0, def: 0, gp: 0 };
   const A = ratings.teams[ev.away.abbr] || { off: 0, def: 0, gp: 0 };
   const eh = ratings.mu + H.off + A.def + ratings.hfa / 2;
   const ea = ratings.mu + A.off + H.def - ratings.hfa / 2;
   const base = eh - ea;
+  // Starting quarterback: an Out/Doubtful starter moves the margin by the backtested amount.
+  const qbOut = (qb && qb[ev.home.abbr] === "out" ? 1 : 0) - (qb && qb[ev.away.abbr] === "out" ? 1 : 0);
+  const qbShift = cfg.qbEffect * qbOut;
   // Head-to-head: counts, but lightly (at most 2 points either way).
   const meets = h2hRows(hist, ratings.current, ev.home.abbr, ev.away.abbr);
   const h2hMargin = meets.length ? meets.reduce((s, g) => s + (g.home === ev.home.abbr ? g.hs - g.as : g.as - g.hs), 0) / meets.length : null;
   const h2hAdj = h2hMargin == null ? 0 : Math.max(-2, Math.min(2, 0.15 * (h2hMargin - base)));
-  const margin = base + h2hAdj;
-  const sigma = ratings.cfg.sigma;
+  const margin = base + qbShift + h2hAdj;
+  const sigma = cfg.sigma;
   const gp = Math.min(H.gp, A.gp);
-  const [lo, hi] = ratings.cfg.minGames;
-  const confidence = gp >= hi ? "High" : gp >= lo ? "Medium" : "Low";
+  const [lo, hi] = cfg.minGames;
+  const pct = phi(margin / sigma);
+  const book = bookHome(ev);
+  const gapPts = book == null ? null : Math.abs(pct - book) * 100;
+  const confidence = confidenceFor({ gp, lo, hi, qb: qb || {}, home: ev.home.abbr, away: ev.away.abbr, weeksIntoSeason: ratings.weeksIntoSeason, calibrated: cfg.calibrated, gapPts });
   return {
-    pct: phi(margin / sigma), margin, spreadHome: Math.round(-margin * 2) / 2, total: eh + ea,
-    eh, ea, H, A, h2hMargin, h2hAdj, meets: meets.length, gp, confidence, sigma, hfa: ratings.hfa, earlySeason: gp < lo,
+    pct, margin, spreadHome: Math.round(-margin * 2) / 2, total: eh + ea,
+    eh, ea, H, A, h2hMargin, h2hAdj, meets: meets.length, gp, confidence, sigma, hfa: ratings.hfa,
+    qbShift, qbStatus: { home: (qb || {})[ev.home.abbr] || null, away: (qb || {})[ev.away.abbr] || null },
+    earlySeason: gp < lo, calibrated: cfg.calibrated,
   };
+}
+// Confidence is a score built from things we can measure. Each point of uncertainty adds to it.
+//  +2 / +1   games played this season for the less-played team (under the low / middle cut-off)
+//  +1        early in the season (first 4 weeks)
+//  +1        a starting QB is Out/Doubtful, or Questionable (who plays is unknown)
+//  +1        the model disagrees with the sportsbook by 10 points or more
+//  +1        the model is not calibrated for this league (NBA for now)
+// 0 High, 1-2 Medium, 3+ Low. Reasons are returned for the Why panel.
+function confidenceFor({ gp, lo, hi, qb, home, away, weeksIntoSeason, calibrated, gapPts }) {
+  const reasons = [];
+  let score = 0;
+  const short = Math.min(3, Math.ceil((hi - gp) / 2));   // how far the less-played team is from a full sample: 0 when full, up to 3
+  if (short > 0) { score += short; reasons.push(`${gp} games this season for the less-played team (a full sample is ${hi})`); }
+  if (weeksIntoSeason < 4) { score += 1; reasons.push("early in the season, when ratings rest on less data"); }
+  const q = [home, away].filter((t) => qb[t]);
+  if (q.length) { score += 1; reasons.push(`QB status uncertain: ${q.map((t) => `${t} ${qb[t] === "out" ? "out/doubtful" : "questionable"}`).join(", ")}`); }
+  if (gapPts != null && gapPts >= 10) { score += 1; reasons.push(`${Math.round(gapPts)} points away from the sportsbook`); }
+  if (!calibrated) { score += 1; reasons.push("not backtested against sportsbook prices yet"); }
+  const label = score === 0 ? "High" : score <= 2 ? "Medium" : "Low";
+  return { label, score, reasons };
 }
 // Live update: remaining game share scales the pregame margin, and the score so far counts fully.
 function minutesLeftFraction(ev) {
@@ -379,15 +439,9 @@ function liveWinPct(pred, ev) {
   if (f === 0) return d > 0 ? 1 : d < 0 ? 0 : 0.5;
   return phi((d + pred.margin * f) / (pred.sigma * Math.sqrt(f)));
 }
-// Sportsbook no-vig probability for the home team, from the moneylines (vig removed).
-function impliedFromAmerican(a) { return a > 0 ? 100 / (a + 100) : -a / (-a + 100); }
-function noVig(awayML, homeML) {
-  const p = impliedFromAmerican(awayML), q = impliedFromAmerican(homeML), t = p + q;
-  return { away: p / t, home: q / t };
-}
-const bookHome = (ev) => (ev.odds && ev.odds.homeML != null && ev.odds.awayML != null ? noVig(ev.odds.awayML, ev.odds.homeML).home : null);
+const bookHome = (ev) => (ev.odds ? (noVig2(ev.odds.awayML, ev.odds.homeML) || {}).second ?? null : null);
 
-// Predictions only for NFL and NBA in Phase 1. Returns { [eventId]: prediction }.
+// Predictions for NFL and NBA only in this version. Returns { [eventId]: prediction }.
 async function predictionsFor(events) {
   const out = {};
   for (const key of ["nfl", "nba"]) {
@@ -396,7 +450,8 @@ async function predictionsFor(events) {
     const hist = await loadHistory(key);
     const ratings = buildRatings(key, hist);
     for (const ev of mine) {
-      const p = predictGame(key, ratings, hist, ev);
+      const qb = key === "nfl" ? await qbStatuses(key, ev.id) : {};
+      const p = predictGame(key, ratings, hist, ev, qb);
       out[ev.id] = { ...p, live: liveWinPct(p, ev), league: key };
     }
   }
@@ -408,18 +463,28 @@ async function pagePredictions() {
   const events = (await Promise.all(["nfl", "nba"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat();
   const preds = await predictionsFor(events);
   const list = events.filter((e) => preds[e.id]);
+  const cal = await loadCalibration();
   if (!list.length) return `<h1>Predictions</h1><div class="empty">No upcoming NFL or NBA games in the next 7 days.</div>`;
   const sections = ["nfl", "nba"].map((k) => {
     const games = list.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
     if (!games.length) return "";
-    const rating = `${LEAGUES[k].name} · history ${k === "nfl" ? "2024–2026" : "2023–24 to 2025–26"}`;
-    return `<h2>${LEAGUES[k].name}</h2><p class="muted">${esc(rating)}. Each % is the chance the home team wins. Tap "Why" for the reasons.</p>
+    const note = MODEL[k].calibrated ? "" : ` <span class="chip">Not yet calibrated</span>`;
+    return `<h2>${LEAGUES[k].name}${note}</h2>
+      <p class="muted">Each % is the chance the home team wins. Tap "Why" for the reasons and the injury check.</p>
       <div class="grid two">${games.map((e) => predictionCard(e, preds[e.id], threshold)).join("")}</div>`;
   }).join("");
   return `<h1>Predictions</h1>
-    <p class="muted">Statistical estimates from each team's recent points scored and allowed. Live games update from the score. Estimates are not guarantees.</p>
-    <div class="note">Injuries are not in these numbers yet. The Why panel lists them so you can judge.</div>
+    <p class="muted">Statistical estimates from each team's recent points scored and allowed, the starting QB, and home-field advantage. Live games update from the score.</p>
+    ${calibrationNote(cal)}
     ${sections}`;
+}
+function calibrationNote(cal) {
+  if (!cal) return `<div class="note warn">Calibration results aren't loaded (data/calibration.json).</div>`;
+  const t = cal.test, b = cal.test_blended;
+  return `<div class="note"><b>How good is the NFL model?</b> Tested on the 2023–2025 seasons, which were not used to set it (${cal.test.n} games).
+    Lower log loss is better. BananaBets: <b>${t.model_logloss.toFixed(3)}</b>. The sportsbook's closing moneyline (vig removed): <b>${t.market_logloss.toFixed(3)}</b>.
+    On this test the sportsbook was more accurate than the model, so flagged games are more often wrong than right.
+    The best blend found used ${Math.round(cal.model_weight_in_blend * 100)}% model, so this model adds no information beyond the sportsbook yet.</div>`;
 }
 function predictionCard(ev, p, threshold) {
   const homeNow = p.live != null ? p.live : p.pct;
@@ -427,7 +492,7 @@ function predictionCard(ev, p, threshold) {
   const gap = book == null ? null : Math.round((p.pct - book) * 100);
   const flag = gap != null && Math.abs(gap) >= threshold
     ? `<span class="chip tag-medium">Differs from sportsbook by ${Math.abs(gap)} pts</span>` : "";
-  const conf = `<span class="chip tag-${p.confidence.toLowerCase()}">${p.confidence} confidence</span>${p.earlySeason ? ` <span class="chip">Early season</span>` : ""}`;
+  const conf = `<span class="chip tag-${p.confidence.label.toLowerCase()}">${p.confidence.label} confidence</span>`;
   const id = `why-${ev.id}`;
   return `<div class="card ${isLive(ev) ? "live" : ""}">
     <div class="kicker"><span>${esc(LEAGUES[ev.league].name)}${ev.playoff ? " · Playoffs" : ""}</span>${statusChip(ev)}</div>
@@ -446,32 +511,28 @@ function predictionCard(ev, p, threshold) {
 function whyHtml(ev, p) {
   const f = (x) => (x >= 0 ? "+" : "") + x.toFixed(1);
   const book = bookHome(ev);
+  const qbLine = p.qbShift
+    ? `<div><b>Starting QB</b>: ${esc(p.qbStatus.home === "out" ? ev.home.abbr : ev.away.abbr)} starter Out/Doubtful, adjusting the margin by ${f(p.qbShift)} points (backtested effect of a starter change)</div>`
+    : `<div><b>Starting QB</b>: no Out/Doubtful starter in ESPN's report${p.qbStatus.home || p.qbStatus.away ? " (a Questionable QB adds uncertainty only)" : ""}</div>`;
   return `<div><b>Expected points</b>: ${esc(ev.home.abbr)} ${p.eh.toFixed(1)}, ${esc(ev.away.abbr)} ${p.ea.toFixed(1)}</div>
     <div><b>Home-field advantage</b>: about ${p.hfa.toFixed(1)} points (league average home margin)</div>
     <div><b>${esc(ev.home.abbr)} offense / defense</b>: ${f(p.H.off)} / ${f(-p.H.def)} points vs league average (defense shown as points saved)</div>
     <div><b>${esc(ev.away.abbr)} offense / defense</b>: ${f(p.A.off)} / ${f(-p.A.def)} points vs league average</div>
-    <div><b>Games this season</b>: ${p.gp} for the less-played team (${p.confidence} confidence)</div>
+    ${qbLine}
     <div><b>Head to head</b>: ${p.meets ? `${p.meets} recent meeting(s), average home margin ${p.h2hMargin.toFixed(1)}; adjusted by ${f(p.h2hAdj)} points` : "no recent meetings in the history"}</div>
     <div><b>Sportsbook (no vig)</b>: ${book == null ? "not listed" : pctTxt(book) + " home"}</div>
+    <div><b>Confidence</b>: ${p.confidence.label}. ${p.confidence.reasons.length ? esc(p.confidence.reasons.join("; ")) + "." : "Plenty of games and a current QB report."}</div>
     <div><b>Live</b>: ${p.live != null ? `${pctTxt(p.live)} home, from the current score and time left` : "starts when the game does"}</div>
-    <div class="muted" style="margin-top:6px">Not included yet: injuries, weather, rest, and starting quarterbacks. Margins vary by about ${p.sigma} points, so a 60% estimate is close to a coin flip.</div>`;
+    <div class="muted" style="margin-top:6px">Not included yet: injuries other than the starting QB, weather, and rest. ${p.calibrated ? "" : "This league's model is not yet calibrated against sportsbook prices."}</div>`;
 }
 
-/* ---------- Markets: Kalshi-style rows with trend charts and sportsbook sources ---------- */
-// Sportsbook and BananaBets numbers are shown next to the Kalshi Yes price.
+/* ---------- Markets: game-by-game Yes/No rows, with Kalshi when connected ---------- */
+const KALSHI_LEAGUES = ["nfl", "nba", "mlb"];
 function nameMatch(outcome, teamName) {
   return !!outcome && teamName.toLowerCase().includes(outcome.toLowerCase());
 }
-function kalshiGroupKey(m) { return (m.event || "").split("-").slice(1).join("-"); }
-function findGame(league, wins, teams) {
-  const closeT = wins.map((m) => m.close_time).find(Boolean);
-  const names = wins.map((m) => m.outcome);
-  return teams.find((e) => e.league === league
-    && names.some((n) => nameMatch(n, e.away.name)) && names.some((n) => nameMatch(n, e.home.name))
-    && (!closeT || Math.abs(new Date(e.date) - new Date(closeT)) < 6 * 86400000));
-}
-// Which team an outcome refers to. Spread titles start with the city ("Seattle wins by over 7.5 points"), so fall back to the city.
 function cityOf(name) { return name.split(" ").slice(0, -1).join(" ").toLowerCase(); }
+// Which team an outcome refers to. Spread titles start with the city ("Seattle wins by over 7.5 points").
 function sideOf(outcome, game) {
   if (!game) return null;
   const exact = [nameMatch(outcome, game.home.name), nameMatch(outcome, game.away.name)];
@@ -481,12 +542,86 @@ function sideOf(outcome, game) {
   if (city[0] !== city[1]) return city[0] ? "home" : "away";
   return null;
 }
-function pct(x) { return x == null ? "—" : Math.round(x * 100) + "%"; }
-function cents(x) { return x == null ? "—" : Math.round(x * 100) + "¢"; }
+function kalshiGroupKey(m) { return (m.event || "").split("-").slice(1).join("-"); }
+// A Kalshi event group belongs to an ESPN game when both teams appear in its winner outcomes and the dates are close.
+function findGame(league, wins, teams) {
+  const closeT = wins.map((m) => m.close_time).find(Boolean);
+  const names = wins.map((m) => m.outcome);
+  return teams.find((e) => e.league === league
+    && names.some((n) => nameMatch(n, e.away.name)) && names.some((n) => nameMatch(n, e.home.name))
+    && (!closeT || Math.abs(new Date(e.date) - new Date(closeT)) < 6 * 86400000));
+}
 function yesPrice(m) {
   if (m.last != null) return m.last;
   if (m.yes_bid != null && m.yes_ask != null) return (m.yes_bid + m.yes_ask) / 2;
   return null;
+}
+const cents = (x) => (x == null ? "—" : Math.round(x * 100) + "¢");
+const pct = (x) => (x == null ? "—" : Math.round(x * 100) + "%");
+// Map each ESPN game id to its Kalshi markets (grouped), for the games in the list.
+async function kalshiByGame(events) {
+  const map = {};
+  const meta = { ok: false, fetched_at: null, errors: [] };
+  if (!kalshiProxy()) return { map, meta };
+  for (const key of KALSHI_LEAGUES) {
+    let data;
+    try { data = await kalshiMarkets(key); } catch (e) { meta.errors.push(`${LEAGUES[key].name}: ${e.message}`); continue; }
+    meta.ok = true; meta.fetched_at = data.fetched_at;
+    const groups = {};
+    for (const m of data.markets || []) (groups[kalshiGroupKey(m)] ||= []).push(m);
+    for (const ms of Object.values(groups)) {
+      const wins = ms.filter((m) => m.kind === "win");
+      const game = wins.length ? findGame(key, wins, events.filter((e) => e.league === key)) : null;
+      if (game) map[game.id] = ms;
+    }
+  }
+  return { map, meta };
+}
+// Kalshi market nearest a line, for the same side (spread or total).
+function nearestKalshi(markets, kind, line, side, game) {
+  const cands = markets.filter((m) => m.kind === kind).map((m) => {
+    const n = Number((m.outcome.match(/over ([\d.]+)/i) || m.outcome.match(/([\d.]+)/) || [])[1]);
+    const s = kind === "spread" ? sideOf(m.outcome, game) : null;
+    return { m, n, s };
+  }).filter((c) => Number.isFinite(c.n) && (kind !== "spread" || c.s === side));
+  if (!cands.length || line == null) return null;
+  cands.sort((a, b) => Math.abs(a.n - Math.abs(line)) - Math.abs(b.n - Math.abs(line)));
+  return cands[0].m;
+}
+// A row shows: the outcome, Yes/No prices, and each source side by side. Trend uses Kalshi history when connected,
+// or the sportsbook line movement (open -> latest) otherwise.
+function marketRow({ label, sub, kalshi, book, bb, mv, trendTicker }) {
+  const rowId = `r-${Math.random().toString(36).slice(2, 9)}`;
+  const kYes = kalshi ? yesPrice(kalshi) : null;
+  // Yes/No shows Kalshi when it's connected for this market, otherwise the sportsbook (labelled either way).
+  const primary = kYes != null ? kYes : book;
+  const from = kYes != null ? "Kalshi" : "Sportsbook";
+  const trend = trendTicker
+    ? `<button class="ghost small" data-trend="${esc(trendTicker)}" data-target="${rowId}" type="button">Trend</button>`
+    : "";
+  return `<div class="mrow">
+    <div class="mname"><b>${esc(label)}</b>${sub ? ` <span class="muted">${esc(sub)}</span>` : ""}</div>
+    <div class="yesno"><span class="yes">Yes ${primary == null ? "—" : pct(primary)}</span><span class="no">No ${primary == null ? "—" : pct(1 - primary)}</span><span class="muted from">${from}</span></div>
+    <div class="src">
+      <span>Kalshi <b>${kYes == null ? "—" : cents(kYes)}</b></span>
+      <span>Sportsbook <b>${pct(book)}</b></span>
+      <span>BananaBets <b>${pct(bb)}</b></span>
+    </div>
+    ${trend}
+    ${mv ? `<div class="move" id="${rowId}">${mv}</div>` : `<div class="move" id="${rowId}" hidden></div>`}
+  </div>`;
+}
+// Opening vs latest, drawn as a two-point line.
+function movementChart(open, latest, fmt) {
+  if (open == null || latest == null) return "";
+  const w = 320, h = 44, x0 = 14, x1 = w - 14;
+  const lo = Math.min(open, latest), hi = Math.max(open, latest);
+  const y = (v) => (hi === lo ? h / 2 : h - 10 - ((v - lo) / (hi - lo)) * (h - 20));
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" role="img" aria-label="Opening ${fmt(open)} to latest ${fmt(latest)}">
+    <polyline points="${x0},${y(open).toFixed(1)} ${x1},${y(latest).toFixed(1)}" fill="none" stroke="#c79a00" stroke-width="2.5"/>
+    <circle cx="${x0}" cy="${y(open).toFixed(1)}" r="3.5" fill="#8f6b00"/><circle cx="${x1}" cy="${y(latest).toFixed(1)}" r="3.5" fill="#c79a00"/>
+    <text x="${x0}" y="${h - 1}">open ${fmt(open)}</text><text x="${x1}" y="${h - 1}" text-anchor="end">now ${fmt(latest)}</text></svg>
+    <div class="muted">Line movement: opened ${fmt(open)}, now ${fmt(latest)}</div>`;
 }
 function sparkline(points) {
   if (!points || points.length < 2) return `<div class="muted">Not enough trade history yet.</div>`;
@@ -497,96 +632,85 @@ function sparkline(points) {
   const first = points[0].p, last = points[points.length - 1].p;
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" role="img" aria-label="Yes price trend, from ${Math.round(first * 100)} to ${Math.round(last * 100)} cents">
     <polyline points="${pts}" fill="none" stroke="#c79a00" stroke-width="2"/></svg>
-    <div class="muted">Yes ${Math.round(first * 100)}¢ → ${Math.round(last * 100)}¢ over the last week</div>`;
+    <div class="muted">Kalshi Yes ${Math.round(first * 100)}¢ → ${Math.round(last * 100)}¢ over the last week</div>`;
 }
-async function kalshiSection(espnEvents, preds) {
-  if (!kalshiProxy()) return `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings.</div>`;
-  let out = "";
-  for (const key of ["nfl", "nba", "mlb", "ufc"]) {
-    let data;
-    try { data = await kalshiMarkets(key); } catch (e) { out += `<div class="note warn">${esc(LEAGUES[key].name)} Kalshi prices unavailable: ${esc(e.message)}</div>`; continue; }
-    const groups = {};
-    for (const m of data.markets || []) (groups[kalshiGroupKey(m)] ||= []).push(m);
-    out += `<h2>${esc(LEAGUES[key].name)} on Kalshi</h2>`;
-    const keys = Object.keys(groups);
-    if (!keys.length) { out += `<div class="empty">No open ${esc(LEAGUES[key].name)} markets on Kalshi right now.</div>`; continue; }
-    const cards = keys.map((k) => marketsCard(key, groups[k], espnEvents, preds));
-    const matched = cards.filter((c) => c.matched).map((c) => c.html);
-    const other = cards.filter((c) => !c.matched).map((c) => c.html);
-    out += `<p class="muted">Kalshi data from ${esc(fmtTime(data.fetched_at))}. Yes prices are in cents, so 30¢ is a 30% chance.</p>`;
-    out += matched.length
-      ? `<div class="grid two">${matched.join("")}</div>`
-      : `<div class="empty">No ${esc(LEAGUES[key].name)} Kalshi markets match an ESPN game in the next 7 days.</div>`;
-    if (other.length) out += `<details class="more"><summary>${other.length} more ${esc(LEAGUES[key].name)} markets (no ESPN game in the next 7 days yet)</summary><div class="grid two">${other.join("")}</div></details>`;
+function gameMarkets(ev, p, kalshiMs) {
+  const o = ev.odds;
+  const kWin = kalshiMs ? kalshiMs.filter((m) => m.kind === "win") : [];
+  const kSpread = kalshiMs || [], kTotal = kalshiMs || [];
+  const hb = bookHome(ev), ab = hb == null ? null : 1 - hb;
+  const home = ev.home.name, away = ev.away.name;
+  const kFor = (side) => kWin.find((m) => sideOf(m.outcome, ev) === side) || null;
+  const rows = [];
+  // Winner
+  rows.push(marketRow({
+    label: `${home} win`, sub: ev.home.abbr, kalshi: kFor("home"), book: hb,
+    bb: p ? p.pct : null, trendTicker: kFor("home") && kFor("home").ticker,
+  }));
+  rows.push(marketRow({
+    label: `${away} win`, sub: ev.away.abbr, kalshi: kFor("away"), book: ab,
+    bb: p ? 1 - p.pct : null, trendTicker: kFor("away") && kFor("away").ticker,
+  }));
+  // Spread (home line; MLB uses the run line)
+  const L = ev.league === "mlb" && o && o.runline ? o.runline.homeLine : (o ? o.spread : null);
+  if (L != null && o) {
+    const sp = noVig2(o.homeSpreadPrice, o.awaySpreadPrice);
+    const homeCover = p ? phi((p.margin + L) / p.sigma) : (ev.league === "mlb" ? null : null);
+    const kh = nearestKalshi(kSpread, "spread", L, "home", ev);
+    const ka = nearestKalshi(kSpread, "spread", -L, "away", ev);
+    const mvOpen = o.openSpread;
+    const mv = mvOpen != null && L != null && mvOpen !== L ? movementChart(mvOpen, L, (x) => signedNum(x)) : "";
+    rows.push(marketRow({
+      label: `${home} ${signedNum(L)}`, sub: "spread", kalshi: kh, book: sp ? sp.first : null,
+      bb: homeCover, mv, trendTicker: kh ? kh.ticker : null,
+    }));
+    rows.push(marketRow({
+      label: `${away} ${signedNum(-L)}`, sub: "spread", kalshi: ka, book: sp ? sp.second : null,
+      bb: homeCover == null ? null : 1 - homeCover, mv: "", trendTicker: ka ? ka.ticker : null,
+    }));
   }
-  return out;
+  // Total
+  if (o && o.total != null) {
+    const T = o.total;
+    const tp = noVig2(o.overPrice, o.underPrice);
+    const over = p ? phi((p.total - T) / MODEL[ev.league].totalSigma) : null;
+    const kt = nearestKalshi(kTotal, "total", T, null, ev);
+    const mv = o.openTotal != null && o.openTotal !== T ? movementChart(o.openTotal, T, (x) => x.toFixed(1)) : "";
+    rows.push(marketRow({
+      label: `Over ${T}`, sub: "total", kalshi: kt, book: tp ? tp.first : null,
+      bb: over, mv, trendTicker: kt ? kt.ticker : null,
+    }));
+    rows.push(marketRow({
+      label: `Under ${T}`, sub: "total", kalshi: null, book: tp ? tp.second : null,
+      bb: over == null ? null : 1 - over, mv: "", trendTicker: null,
+    }));
+  }
+  return rows.join("");
 }
-function marketsCard(league, ms, espnEvents, preds) {
-  const wins = ms.filter((m) => m.kind === "win");
-  const spreads = ms.filter((m) => m.kind === "spread");
-  const totals = ms.filter((m) => m.kind === "total");
-  const game = findGame(league, wins, espnEvents);
-  const title = game ? `${game.away.name} at ${game.home.name}` : wins.map((m) => m.outcome).join(" vs ");
-  const p = game && preds[game.id];
-  const threshold = settings().edgeThreshold;
-  const rowBase = (m, bb, book, flagText) => {
-    const y = yesPrice(m);
-    const id = `t-${m.ticker.replace(/[^A-Za-z0-9]/g, "")}`;
-    return `<div class="mrow">
-      <div class="mname"><b>${esc(m.outcome)}</b>${flagText ? ` <span class="chip tag-medium">${esc(flagText)}</span>` : ""}</div>
-      <div class="yesno"><span class="yes">Yes ${cents(y)}</span><span class="no">No ${y == null ? "—" : Math.round((1 - y) * 100) + "¢"}</span></div>
-      <div class="src"><span>Kalshi <b>${pct(y)}</b></span><span>Sportsbook <b>${pct(book)}</b></span><span>BananaBets <b>${pct(bb)}</b></span></div>
-      <button class="ghost small" data-trend="${esc(m.ticker)}" data-target="${id}" type="button">Trend</button>
-      <div id="${id}" class="trend" hidden></div></div>`;
-  };
-  let html = `<div class="card"><div class="kicker"><span>${esc(title)}</span>${game ? `<span class="chip">${esc(fmtTime(game.date))}</span>` : `<span class="chip">no matching ESPN game</span>`}</div>`;
-  if (wins.length) {
-    html += `<div class="muted" style="margin-top:6px">Winner</div>`;
-    for (const m of wins) {
-      const side = sideOf(m.outcome, game);
-      const hb = game ? bookHome(game) : null;
-      const book = hb != null && side ? (side === "home" ? hb : 1 - hb) : null;
-      const bb = p && side ? (side === "home" ? p.pct : 1 - p.pct) : null;
-      const y = yesPrice(m);
-      const gap = bb != null && y != null ? Math.round((bb - y) * 100) : null;
-      const flag = gap != null && Math.abs(gap) >= threshold ? `${Math.abs(gap)} pt gap` : "";
-      html += rowBase(m, bb, book, flag);
-    }
-  }
-  if (spreads.length) {
-    html += `<div class="muted" style="margin-top:8px">Spread</div>`;
-    for (const m of spreads) {
-      const line = Number((m.outcome.match(/over ([\d.]+)/) || [])[1]);
-      const side = sideOf(m.outcome, game);
-      const sig = p ? p.sigma : null;
-      const bb = p && side && Number.isFinite(line) && sig
-        ? phi(((side === "home" ? p.margin : -p.margin) - line) / sig) : null;
-      html += rowBase(m, bb, null, "");
-    }
-  }
-  if (totals.length) {
-    html += `<div class="muted" style="margin-top:8px">Total</div>`;
-    for (const m of totals) {
-      const line = Number((m.outcome.match(/([\d.]+)/) || [])[1]);
-      const bb = p && Number.isFinite(line) ? phi((p.total - line) / MODEL[league].totalSigma) : null;
-      html += rowBase(m, bb, null, "");
-    }
-  }
-  if (game && game.odds) html += lineMovement(game);
-  if (game && game.state === "in") html += liveCover(game);
-  return { matched: !!game, html: html + `</div>` };
-}
-function lineMovement(game) {
-  const o = game.odds;
-  const row = (label, open, now, f) => `<tr><td>${label}</td><td>${open == null ? "—" : f(open)}</td><td>${now == null ? "—" : f(now)}</td></tr>`;
-  const ml = (x) => american(x);
-  return `<div class="muted" style="margin-top:10px">Line movement (opening vs latest)</div>
-    <div class="scroll"><table class="stat-table"><thead><tr><th>Market</th><th>Opening</th><th>Latest</th></tr></thead><tbody>
-      ${row(`${esc(game.home.abbr)} moneyline`, o.openHomeML, o.homeML, ml)}
-      ${row(`${esc(game.away.abbr)} moneyline`, o.openAwayML, o.awayML, ml)}
-      ${row(`${esc(game.home.abbr)} spread`, o.openSpread, o.spread, signedNum)}
-      ${row("Total", o.openTotal, o.total, (x) => x)}
-    </tbody></table></div>`;
+async function pageMarkets() {
+  const events = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat()
+    .filter((e) => !e.completed && !e.preseason && e.odds);
+  const preds = await predictionsFor(events);
+  const { map: kmap, meta } = await kalshiByGame(events);
+  const kalshiNote = !kalshiProxy()
+    ? `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings. Sportsbook and BananaBets numbers are shown below either way.</div>`
+    : meta.errors.length
+      ? `<div class="note warn">Kalshi: ${esc(meta.errors.join("; "))}</div>`
+      : `<p class="muted">Kalshi data from ${esc(fmtTime(meta.fetched_at))}. Yes prices are in cents, so 30¢ is a 30% chance.</p>`;
+  const byLeague = ["nfl", "nba", "mlb"].map((k) => {
+    const list = events.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
+    if (!list.length) return "";
+    return `<h2>${LEAGUES[k].name}</h2><div class="grid two">${list.map((e) => `
+      <div class="card ${isLive(e) ? "live" : ""}">
+        <div class="kicker"><span>${esc(e.away.abbr)} @ ${esc(e.home.abbr)}</span>${statusChip(e)}</div>
+        ${gameMarkets(e, preds[e.id], kmap[e.id])}
+        ${kmap[e.id] && isLive(e) ? liveCover(e) : ""}
+      </div>`).join("")}</div>`;
+  }).join("");
+  return `<h1>Markets</h1>
+    <p class="muted">Yes/No prices for each game: winner, spread and total. Sportsbook prices have the vig removed. BananaBets uses the model where it covers the league (NFL and NBA; MLB is not modelled yet).</p>
+    ${kalshiNote}
+    ${byLeague || `<div class="empty">No upcoming games with odds in the next 7 days.</div>`}`;
 }
 function liveCover(game) {
   const f = minutesLeftFraction(game);
@@ -606,21 +730,6 @@ function liveCover(game) {
   }
   return `<div class="lines" style="margin-top:8px">${parts.join("") || `<span class="muted">Live spread and total tracking needs odds.</span>`}</div>`;
 }
-async function pageMarkets() {
-  const all = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat();
-  const preds = await predictionsFor(all);
-  const kalshi = await kalshiSection(all, preds);
-  const rows = all.filter((e) => e.odds && e.odds.homeML != null && e.odds.awayML != null && !e.completed).slice(0, 40).map((e) => {
-    const fair = noVig(e.odds.awayML, e.odds.homeML);
-    return `<tr><td>${esc(LEAGUES[e.league].name)}</td><td>${esc(e.away.abbr)} @ ${esc(e.home.abbr)}</td><td>${esc(fmtTime(e.date))}</td>
-      <td>${esc(american(e.odds.awayML))} / ${esc(american(e.odds.homeML))}</td><td>${(fair.away * 100).toFixed(1)}% / ${(fair.home * 100).toFixed(1)}%</td></tr>`;
-  });
-  return `<h1>Markets</h1>
-    <p class="muted">Kalshi Yes/No prices next to sportsbook odds (vig removed) and BananaBets' estimate. Kalshi prices are read-only. This is a comparison, not a recommendation.</p>
-    ${kalshi}
-    <h2>Sportsbook moneylines (no vig)</h2>
-    ${rows.length ? `<div class="scroll"><table class="stat-table"><thead><tr><th>League</th><th>Game</th><th>Start</th><th>ML (away / home)</th><th>No-vig % (away / home)</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : `<div class="empty">No moneylines listed for upcoming games right now.</div>`}`;
-}
 
 /* ---------- Record, Settings ---------- */
 function pageRecord() {
@@ -630,13 +739,13 @@ function pageSettings() {
   const s = settings();
   return `<h1>Settings</h1>
     <label class="field"><span>Flag gaps of at least (points)</span><input id="edge" type="number" min="1" max="30" step="0.5" value="${esc(s.edgeThreshold)}"></label>
-    <p class="muted">Used on Predictions and Markets. Default is 5.</p>
+    <p class="muted">Used on Predictions and Markets. Default is 10, because the backtest shows smaller gaps are mostly noise. Set it to 5 to see more flags.</p>
     <label class="field"><span>Kalshi proxy address</span><input id="kproxy" type="text" placeholder="https://bananabets-kalshi.YOUR-NAME.workers.dev" value="${esc(s.kalshiProxy)}" style="width:min(320px,60vw)"></label>
     <p class="muted">Paste the Cloudflare Worker address from worker/SETUP.md. Leave blank to skip Kalshi.</p>
     <h2>Data sources</h2>
     <div class="card"><b>ESPN public site API</b><div class="muted">Scores, schedules, stats, odds, win probability, injuries. Unofficial; may change without notice.</div></div>
     <div class="card" style="margin-top:10px"><b>Kalshi</b><div class="muted">Read-only prices through your Cloudflare Worker.</div></div>
-    <div class="card" style="margin-top:10px"><b>Game history</b><div class="muted">data/nfl.json and data/nba.json, rebuilt weekly by a GitHub Action from ESPN.</div></div>
+    <div class="card" style="margin-top:10px"><b>Game history and calibration</b><div class="muted">data/nfl.json, data/nba.json (rebuilt weekly from ESPN) and data/calibration.json (from scripts/backtest_nfl.py).</div></div>
     <div class="card" style="margin-top:10px"><b>Underdog</b><div class="muted">No public data. Lines would be typed in by hand.</div></div>
     <h2>Refresh</h2><p class="muted">Every 20 seconds while a game is live; every 5 minutes otherwise. The Refresh button updates now.</p>`;
 }

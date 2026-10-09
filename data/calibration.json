@@ -1,0 +1,186 @@
+{
+  "generated_for": "NFL",
+  "chosen": {
+    "half_life": 180,
+    "shrink": 4,
+    "prior": 0,
+    "sigma": 11.5
+  },
+  "model_weight_in_blend": 0.0,
+  "training_seasons": "2016-2022",
+  "test_seasons": "2023-2025 (not used to choose settings)",
+  "train": {
+    "n": 1906,
+    "model_brier": 0.2208667103341679,
+    "model_logloss": 0.6321799026414947,
+    "base_rate_brier": 0.24767013980262248,
+    "n_with_market": 1905,
+    "market_brier": 0.2111400802685578,
+    "market_logloss": 0.609756005858979,
+    "model_brier_on_market_games": 0.2209580029440468
+  },
+  "test": {
+    "n": 855,
+    "model_brier": 0.22337472043634296,
+    "model_logloss": 0.637670474944706,
+    "base_rate_brier": 0.247644061420608,
+    "n_with_market": 855,
+    "market_brier": 0.21000310000949593,
+    "market_logloss": 0.6073602701231698,
+    "model_brier_on_market_games": 0.22337472043634296
+  },
+  "test_blended": {
+    "n": 855,
+    "model_brier": 0.21000310000949593,
+    "model_logloss": 0.6073602701231698,
+    "base_rate_brier": 0.247644061420608,
+    "n_with_market": 855,
+    "market_brier": 0.21000310000949593,
+    "market_logloss": 0.6073602701231698,
+    "model_brier_on_market_games": 0.21000310000949593
+  },
+  "reliability_test": [
+    {
+      "bin": "10-20%",
+      "n": 9,
+      "predicted": 0.169,
+      "observed": 0.333
+    },
+    {
+      "bin": "20-30%",
+      "n": 39,
+      "predicted": 0.257,
+      "observed": 0.41
+    },
+    {
+      "bin": "30-40%",
+      "n": 86,
+      "predicted": 0.355,
+      "observed": 0.233
+    },
+    {
+      "bin": "40-50%",
+      "n": 159,
+      "predicted": 0.456,
+      "observed": 0.428
+    },
+    {
+      "bin": "50-60%",
+      "n": 187,
+      "predicted": 0.552,
+      "observed": 0.508
+    },
+    {
+      "bin": "60-70%",
+      "n": 170,
+      "predicted": 0.649,
+      "observed": 0.635
+    },
+    {
+      "bin": "70-80%",
+      "n": 127,
+      "predicted": 0.745,
+      "observed": 0.748
+    },
+    {
+      "bin": "80-90%",
+      "n": 71,
+      "predicted": 0.84,
+      "observed": 0.803
+    },
+    {
+      "bin": "90-100%",
+      "n": 7,
+      "predicted": 0.909,
+      "observed": 1.0
+    }
+  ],
+  "flags_test_model_only": {
+    "5pts": {
+      "threshold_pts": 5,
+      "flags": 482,
+      "flags_per_week": 7.3,
+      "model_favourite_won_pct": 61.6,
+      "market_favourite_won_pct": 68.5
+    },
+    "8pts": {
+      "threshold_pts": 8,
+      "flags": 309,
+      "flags_per_week": 4.68,
+      "model_favourite_won_pct": 58.3,
+      "market_favourite_won_pct": 70.6
+    },
+    "10pts": {
+      "threshold_pts": 10,
+      "flags": 239,
+      "flags_per_week": 3.62,
+      "model_favourite_won_pct": 54.0,
+      "market_favourite_won_pct": 67.8
+    }
+  },
+  "flags_test_blended": {
+    "5pts": {
+      "threshold_pts": 5,
+      "flags": 0,
+      "flags_per_week": 0.0,
+      "model_favourite_won_pct": null,
+      "market_favourite_won_pct": null
+    },
+    "8pts": {
+      "threshold_pts": 8,
+      "flags": 0,
+      "flags_per_week": 0.0,
+      "model_favourite_won_pct": null,
+      "market_favourite_won_pct": null
+    },
+    "10pts": {
+      "threshold_pts": 10,
+      "flags": 0,
+      "flags_per_week": 0.0,
+      "model_favourite_won_pct": null,
+      "market_favourite_won_pct": null
+    }
+  },
+  "starting_qb_effect": {
+    "points_per_qb_change": -2.9,
+    "samples": 598,
+    "note": "Negative means the team with the new starter does worse than the model expects."
+  },
+  "variant_with_starter_change_adjustment": {
+    "test": {
+      "n": 855,
+      "model_brier": 0.2223105700339123,
+      "model_logloss": 0.6350719051853425,
+      "base_rate_brier": 0.247644061420608,
+      "n_with_market": 855,
+      "market_brier": 0.21000310000949593,
+      "market_logloss": 0.6073602701231698,
+      "model_brier_on_market_games": 0.2223105700339123
+    },
+    "best_blend_weight_on_train": 0.0,
+    "flags_test": {
+      "5pts": {
+        "threshold_pts": 5,
+        "flags": 476,
+        "flags_per_week": 7.21,
+        "model_favourite_won_pct": 61.8,
+        "market_favourite_won_pct": 67.9
+      },
+      "8pts": {
+        "threshold_pts": 8,
+        "flags": 301,
+        "flags_per_week": 4.56,
+        "model_favourite_won_pct": 58.5,
+        "market_favourite_won_pct": 69.4
+      },
+      "10pts": {
+        "threshold_pts": 10,
+        "flags": 234,
+        "flags_per_week": 3.55,
+        "model_favourite_won_pct": 56.0,
+        "market_favourite_won_pct": 68.4
+      }
+    }
+  },
+  "home_field_points_recent": 2.41
+}
