@@ -12,7 +12,7 @@ const LEAGUES = {
 const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Network", "TNT", "truTV", "NBA TV", "MLBN", "Netflix"];
 const TZ = "America/Chicago";
 const SETTINGS_KEY = "bananabets.settings";
-const DEFAULTS = { edgeThreshold: 5 };
+const DEFAULTS = { edgeThreshold: 5, kalshiProxy: "" };      // kalshiProxy: address of your Cloudflare Worker (see worker/SETUP.md)
 
 const cache = new Map();                      // url -> { at, data }; avoids duplicate requests within 10 s
 async function getJSON(url, { maxAgeMs = 10000 } = {}) {
@@ -257,9 +257,11 @@ async function pageMarkets() {
     return `<tr><td>${esc(LEAGUES[e.league].name)}</td><td>${esc(e.away.abbr)} @ ${esc(e.home.abbr)}</td><td>${esc(fmtTime(e.date))}</td>
       <td>${esc(american(e.odds.awayML))} / ${esc(american(e.odds.homeML))}</td><td>${(fair.away * 100).toFixed(1)}% / ${(fair.home * 100).toFixed(1)}%</td></tr>`;
   });
+  const kalshi = await kalshiSection(all);
   return `<h1>Markets</h1>
     <p class="muted">Sportsbook moneylines from ESPN, with the vig (bookmaker margin) removed. These are odds comparisons, not recommendations.</p>
-    <div class="note warn">Kalshi prices are not connected yet. They need a free Cloudflare Worker, because Kalshi blocks requests from websites. Next step.</div>
+    ${kalshi}
+    <h2>Sportsbook moneylines (no-vig)</h2>
     ${rows.length ? `<div class="scroll"><table class="stat-table"><thead><tr><th>League</th><th>Game</th><th>Start</th><th>ML (away / home)</th><th>No-vig % (away / home)</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : `<div class="empty">No moneylines listed for upcoming games right now.</div>`}`;
 }
 // Remove the bookmaker margin: convert both American prices to implied probability, then scale so they sum to 1.
@@ -267,6 +269,60 @@ function impliedFromAmerican(a) { return a > 0 ? 100 / (a + 100) : -a / (-a + 10
 function noVig(awayML, homeML) {
   const p = impliedFromAmerican(awayML), q = impliedFromAmerican(homeML), t = p + q;
   return { away: p / t, home: q / t };
+}
+
+/* Kalshi: prices come from the Cloudflare Worker proxy (Kalshi blocks direct browser requests). */
+const KALSHI_LEAGUES = ["nfl", "nba", "mlb", "ufc"];
+async function kalshiSection(espnEvents) {
+  const proxy = (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
+  if (!proxy) return `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings.</div>`;
+  const got = await Promise.all(KALSHI_LEAGUES.map((k) => getJSON(`${proxy}/markets?league=${k}`, { maxAgeMs: 30000 })
+    .then((d) => ({ k, d })).catch((e) => ({ k, err: e.message }))));
+  const teams = espnEvents.filter((e) => e.home && e.away);
+  let out = "";
+  for (const { k, d, err } of got) {
+    if (err) { out += `<div class="note warn">${esc(LEAGUES[k].name)} Kalshi prices unavailable: ${esc(err)}</div>`; continue; }
+    const groups = {};
+    for (const m of d.markets || []) (groups[m.event] ||= []).push(m);
+    const events = Object.values(groups);
+    out += `<h2>${esc(LEAGUES[k].name)} on Kalshi</h2>`;
+    out += events.length
+      ? `<p class="muted">Kalshi data from ${esc(fmtTime(d.fetched_at))}. Prices are the Yes price in cents.</p><div class="grid two">${events.map((ms) => kalshiCard(k, ms, teams)).join("")}</div>`
+      : `<div class="empty">No open ${esc(LEAGUES[k].name)} markets on Kalshi right now.</div>`;
+  }
+  return out;
+}
+function nameMatch(outcome, teamName) {
+  return !!outcome && teamName.toLowerCase().includes(outcome.toLowerCase());
+}
+function sportsbookShare(game, outcome) {
+  if (!game.odds || game.odds.homeML == null || game.odds.awayML == null) return null;
+  const fair = noVig(game.odds.awayML, game.odds.homeML);
+  if (nameMatch(outcome, game.away.name)) return fair.away;
+  if (nameMatch(outcome, game.home.name)) return fair.home;
+  return null;
+}
+// Only compare with a sportsbook game that has BOTH teams and starts near the Kalshi close time (same team can meet again weeks later).
+function findGame(k, ms, teams) {
+  const closeT = ms.map((m) => m.close_time).find(Boolean);
+  const names = ms.map((m) => m.outcome);
+  return teams.find((e) => e.league === k
+    && names.some((n) => nameMatch(n, e.away.name)) && names.some((n) => nameMatch(n, e.home.name))
+    && (!closeT || Math.abs(new Date(e.date) - new Date(closeT)) < 6 * 86400000));
+}
+function kalshiCard(k, ms, teams) {
+  const game = findGame(k, ms, teams);
+  const rows = ms.map((m) => {
+    const p = m.last ?? (m.yes_bid != null && m.yes_ask != null ? (m.yes_bid + m.yes_ask) / 2 : null);
+    const move = m.last != null && m.previous != null ? Math.round((m.last - m.previous) * 100) : 0;
+    const arrow = move > 0 ? `▲ ${move}¢` : move < 0 ? `▼ ${-move}¢` : "no change";
+    const book = sportsbookShare(game || { odds: null }, m.outcome);
+    return `<div class="lines"><span><b>${esc(m.outcome)}</b></span><span>Kalshi <b>${p == null ? "—" : Math.round(p * 100) + "¢"}</b></span>
+      <span class="muted">${esc(arrow)}</span><span>Sportsbook <b>${book == null ? "—" : (book * 100).toFixed(0) + "%"}</b></span></div>`;
+  }).join("");
+  const title = ms.map((m) => m.outcome).join(" vs ");
+  return `<div class="card"><div class="kicker"><span>${esc(title)}</span></div>${rows}
+    ${game ? "" : `<div class="muted" style="margin-top:6px">No matching ESPN game, so no sportsbook comparison.</div>`}</div>`;
 }
 
 function pagePredictions() {
@@ -280,6 +336,8 @@ function pageSettings() {
   return `<h1>Settings</h1>
     <label class="field"><span>Flag gaps of at least (points)</span><input id="edge" type="number" min="1" max="30" step="0.5" value="${esc(s.edgeThreshold)}"></label>
     <p class="muted">Used by the Markets and Predictions tabs once they're built. Default is 5.</p>
+    <label class="field"><span>Kalshi proxy address</span><input id="kproxy" type="text" placeholder="https://bananabets-kalshi.YOUR-NAME.workers.dev" value="${esc(s.kalshiProxy)}" style="width:min(320px,60vw)"></label>
+    <p class="muted">Paste the Cloudflare Worker address from worker/SETUP.md. Leave blank to skip Kalshi.</p>
     <h2>Data sources</h2>
     <div class="card"><b>ESPN public site API</b><div class="muted">Scores, schedules, stats, odds, win probability, injuries. Unofficial; may change without notice.</div></div>
     <div class="card" style="margin-top:10px"><b>Kalshi</b><div class="muted">Not connected yet.</div></div>
@@ -314,7 +372,9 @@ async function render({ keepScroll = false } = {}) {
     const btn = $("#showall");
     if (btn) btn.onclick = () => { const box = $("#allstats"); box.hidden = !box.hidden; btn.textContent = box.hidden ? "Show all stats" : "Hide stats"; btn.setAttribute("aria-expanded", String(!box.hidden)); };
     const edge = $("#edge");
-    if (edge) edge.onchange = () => { const v = Math.max(1, Math.min(30, Number(edge.value) || 5)); saveSettings({ ...settings(), edgeThreshold: v }); edge.value = v; };
+    const kp = $("#kproxy");
+    if (kp) kp.onchange = () => saveSettings({ ...settings(), kalshiProxy: kp.value.trim() });
+    if (edge) edge.onchange =() => { const v = Math.max(1, Math.min(30, Number(edge.value) || 5)); saveSettings({ ...settings(), edgeThreshold: v }); edge.value = v; };
     if (keepScroll) window.scrollTo(0, top);
     else window.scrollTo(0, 0);
     setUpdated(new Date());
