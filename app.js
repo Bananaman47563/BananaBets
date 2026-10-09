@@ -134,7 +134,7 @@ async function loadCalibration() {
 }
 const kalshiProxy = () => (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
 async function kalshiMarkets(key) {
-  return getJSON(`${kalshiProxy()}/markets?league=${key}`, { maxAgeMs: 30000 });
+  return getJSON(`${kalshiProxy()}/markets?league=${key}`, { maxAgeMs: 55000 });
 }
 async function kalshiHistory(ticker, days = 7) {
   return getJSON(`${kalshiProxy()}/history?ticker=${encodeURIComponent(ticker)}&days=${days}`, { maxAgeMs: 120000 });
@@ -559,13 +559,20 @@ function yesPrice(m) {
 const cents = (x) => (x == null ? "—" : Math.round(x * 100) + "¢");
 const pct = (x) => (x == null ? "—" : Math.round(x * 100) + "%");
 // Map each ESPN game id to its Kalshi markets (grouped), for the games in the list.
-async function kalshiByGame(events) {
+// Only the leagues listed are requested, so Kalshi is never asked for games that aren't on screen.
+async function kalshiByGame(events, leagues) {
   const map = {};
-  const meta = { ok: false, fetched_at: null, errors: [] };
+  const meta = { ok: false, fetched_at: null, errors: [], stale: false, message: "" };
   if (!kalshiProxy()) return { map, meta };
-  for (const key of KALSHI_LEAGUES) {
+  for (const key of leagues) {
     let data;
-    try { data = await kalshiMarkets(key); } catch (e) { meta.errors.push(`${LEAGUES[key].name}: ${e.message}`); continue; }
+    try { data = await kalshiMarkets(key); }
+    catch (e) {
+      const limited = /429|503/.test(e.message);
+      meta.errors.push(limited ? "Kalshi rate-limited, no prices yet. Try again in a minute." : `${LEAGUES[key].name}: Kalshi unavailable right now.`);
+      continue;
+    }
+    if (data.stale) { meta.stale = true; meta.message = data.message || "Kalshi rate-limited, showing last prices"; }
     meta.ok = true; meta.fetched_at = data.fetched_at;
     const groups = {};
     for (const m of data.markets || []) (groups[kalshiGroupKey(m)] ||= []).push(m);
@@ -687,18 +694,35 @@ function gameMarkets(ev, p, kalshiMs) {
   }
   return rows.join("");
 }
+// Markets shows live games and games starting in the next 3 hours by default. "Show all this week" widens it,
+// and only then does the page ask Kalshi about the rest of the week.
+let marketsShowAll = false;
+const SOON_MS = 3 * 3600 * 1000;
 async function pageMarkets() {
   const events = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat()
     .filter((e) => !e.completed && !e.preseason && e.odds);
-  const preds = await predictionsFor(events);
-  const { map: kmap, meta } = await kalshiByGame(events);
+  const now = Date.now();
+  const inWindow = (e) => isLive(e) || (Date.parse(e.date) >= now - 60000 && Date.parse(e.date) <= now + SOON_MS);
+  const shown = marketsShowAll ? events : events.filter(inWindow);
+  const leagues = [...new Set(shown.map((e) => e.league))].filter((k) => KALSHI_LEAGUES.includes(k));
+  const preds = await predictionsFor(shown);
+  const { map: kmap, meta } = await kalshiByGame(shown, leagues);
   const kalshiNote = !kalshiProxy()
     ? `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings. Sportsbook and BananaBets numbers are shown below either way.</div>`
     : meta.errors.length
-      ? `<div class="note warn">Kalshi: ${esc(meta.errors.join("; "))}</div>`
-      : `<p class="muted">Kalshi data from ${esc(fmtTime(meta.fetched_at))}. Yes prices are in cents, so 30¢ is a 30% chance.</p>`;
+      ? `<div class="note warn">${esc(meta.errors.join(" "))}</div>`
+      : meta.stale
+        ? `<div class="note warn">${esc(meta.message)}. Prices as of ${esc(fmtTime(meta.fetched_at))}.</div>`
+        : leagues.length
+          ? `<p class="muted">Kalshi data from ${esc(fmtTime(meta.fetched_at))}. Yes prices are in cents, so 30¢ is a 30% chance.</p>`
+          : `<p class="muted">Kalshi is only checked when games are on screen.</p>`;
+  const windowLine = marketsShowAll
+    ? `<p class="muted">Showing every game this week (${shown.length}). Kalshi prices are fetched for all of them.</p>`
+    : `<p class="muted">Showing live games and games starting in the next 3 hours (${shown.length}).</p>`;
+  const toggle = `<div class="row" style="margin:10px 0"><button id="showAllBtn" class="secondary" type="button">${marketsShowAll ? "Show only the next 3 hours" : "Show all this week"}</button>
+    ${marketsShowAll ? "" : `<span class="muted">Fetches Kalshi prices for the rest of the week.</span>`}</div>`;
   const byLeague = ["nfl", "nba", "mlb"].map((k) => {
-    const list = events.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
+    const list = shown.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
     if (!list.length) return "";
     return `<h2>${LEAGUES[k].name}</h2><div class="grid two">${list.map((e) => `
       <div class="card ${isLive(e) ? "live" : ""}">
@@ -709,8 +733,10 @@ async function pageMarkets() {
   }).join("");
   return `<h1>Markets</h1>
     <p class="muted">Yes/No prices for each game: winner, spread and total. Sportsbook prices have the vig removed. BananaBets uses the model where it covers the league (NFL and NBA; MLB is not modelled yet).</p>
+    ${windowLine}
+    ${toggle}
     ${kalshiNote}
-    ${byLeague || `<div class="empty">No upcoming games with odds in the next 7 days.</div>`}`;
+    ${byLeague || `<div class="empty">${marketsShowAll ? "No upcoming games with odds in the next 7 days." : "No games live or starting in the next 3 hours. Tap “Show all this week” to see the rest."}</div>`}`;
 }
 function liveCover(game) {
   const f = minutesLeftFraction(game);
@@ -779,6 +805,8 @@ async function render({ keepScroll = false } = {}) {
   scheduleNext();
 }
 function wireView() {
+  const sa = $("#showAllBtn");
+  if (sa) sa.onclick = () => { marketsShowAll = !marketsShowAll; render(); };
   const btn = $("#showall");
   if (btn) btn.onclick = () => { const box = $("#allstats"); box.hidden = !box.hidden; btn.textContent = box.hidden ? "Show all stats" : "Hide stats"; btn.setAttribute("aria-expanded", String(!box.hidden)); };
   document.querySelectorAll("[data-why]").forEach((b) => b.onclick = () => {
@@ -805,10 +833,13 @@ function setUpdated(d) {
   $("#updated").textContent = d ? `Last updated ${new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" }).format(d)}` : "Update failed";
 }
 let timer = null;
+// Markets re-checks every 60 seconds. Leaving the tab clears this timer, so Kalshi is no longer polled.
 function scheduleNext() {
   clearTimeout(timer);
+  const onMarkets = currentRoute()[0] === "markets";
   const live = !!document.querySelector(".card.live, .game.live");
-  timer = setTimeout(() => render({ keepScroll: true }), live ? 20000 : 300000);
+  const ms = onMarkets ? 60000 : live ? 20000 : 300000;
+  timer = setTimeout(() => render({ keepScroll: true }), ms);
 }
 $("#refresh").addEventListener("click", async (ev) => {
   const b = ev.currentTarget; b.disabled = true; cache.clear();
