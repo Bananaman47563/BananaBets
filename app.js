@@ -1,20 +1,21 @@
-/* BananaBets: single-page site. All ESPN calls live in the DATA section so they are easy to fix if ESPN changes. */
+/* BananaBets: single-page site.
+   DATA section: every outside call lives here (ESPN, the Kalshi proxy and the history files), so it's easy to fix if one changes. */
 "use strict";
 
-/* ---------- DATA: ESPN public (unofficial) site API. Keep every endpoint here. ---------- */
+/* ---------- DATA: ESPN public (unofficial) site API ---------- */
 const ESPN = "https://site.api.espn.com/apis/site/v2/sports/";
 const LEAGUES = {
-  nfl: { path: "football/nfl", name: "NFL", kind: "team" },
-  nba: { path: "basketball/nba", name: "NBA", kind: "team" },
+  nfl: { path: "football/nfl", name: "NFL", kind: "team", period: 15, length: 60, periods: 4 },
+  nba: { path: "basketball/nba", name: "NBA", kind: "team", period: 12, length: 48, periods: 4 },
   mlb: { path: "baseball/mlb", name: "MLB", kind: "team" },
   ufc: { path: "mma/ufc", name: "UFC", kind: "fight" },
 };
 const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Network", "TNT", "truTV", "NBA TV", "MLBN", "Netflix"];
 const TZ = "America/Chicago";
 const SETTINGS_KEY = "bananabets.settings";
-const DEFAULTS = { edgeThreshold: 5, kalshiProxy: "" };      // kalshiProxy: address of your Cloudflare Worker (see worker/SETUP.md)
+const DEFAULTS = { edgeThreshold: 5, kalshiProxy: "" };   // kalshiProxy: address of your Cloudflare Worker (worker/SETUP.md)
 
-const cache = new Map();                      // url -> { at, data }; avoids duplicate requests within 10 s
+const cache = new Map();                                    // url -> { at, data }; avoids duplicate requests
 async function getJSON(url, { maxAgeMs = 10000 } = {}) {
   const hit = cache.get(url);
   if (hit && Date.now() - hit.at < maxAgeMs) return hit.data;
@@ -22,7 +23,7 @@ async function getJSON(url, { maxAgeMs = 10000 } = {}) {
   const timer = setTimeout(() => ctl.abort(), 12000);
   try {
     const r = await fetch(url, { signal: ctl.signal });
-    if (!r.ok) throw new Error(`ESPN responded ${r.status}`);
+    if (!r.ok) throw new Error(`responded ${r.status}`);
     const data = await r.json();
     cache.set(url, { at: Date.now(), data });
     return data;
@@ -30,18 +31,17 @@ async function getJSON(url, { maxAgeMs = 10000 } = {}) {
 }
 
 const ymd = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d).replaceAll("-", "");
-const centralDayKey = (iso) => new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(iso));
+const dayKey = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
 const centralHour = (iso) => Number(new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hourCycle: "h23" }).format(new Date(iso)));
 
-// Scoreboard for a league, optionally a date range (today to +7 days for the week-ahead list).
+// ESPN's date-range form no longer works, so the week view asks for each of the next 8 days and merges them.
 async function scoreboard(key, { week = false } = {}) {
-  const today = new Date();
-  const ahead = new Date(Date.now() + 7 * 86400000);
-  const url = ESPN + LEAGUES[key].path + "/scoreboard" + (week ? `?dates=${ymd(today)}-${ymd(ahead)}&limit=300` : "");
-  const raw = await getJSON(url);
-  return (raw.events || []).map((e) => normalizeEvent(key, e));
+  const days = week ? Array.from({ length: 8 }, (_, i) => ymd(new Date(Date.now() + i * 86400000))) : [null];
+  const pages = await Promise.all(days.map((d) => getJSON(ESPN + LEAGUES[key].path + "/scoreboard" + (d ? `?dates=${d}` : ""))));
+  const seen = new Map();
+  for (const raw of pages) for (const e of raw.events || []) if (!seen.has(e.id)) seen.set(e.id, normalizeEvent(key, e));
+  return [...seen.values()];
 }
-
 async function summary(key, id) {
   return getJSON(`${ESPN}${LEAGUES[key].path}/summary?event=${encodeURIComponent(id)}`, { maxAgeMs: 8000 });
 }
@@ -52,44 +52,60 @@ function normalizeEvent(key, e) {
   const type = st.type || {};
   const base = {
     league: key, id: e.id, name: e.name || e.shortName || "", date: e.date,
-    state: type.state || "pre",                       // pre | in | post
-    completed: !!type.completed,
-    detail: type.shortDetail || type.detail || "",
-    period: st.period || 0, clock: st.displayClock || "",
-    playoff: e.season && e.season.type === 3,
+    state: type.state || "pre", completed: !!type.completed,
+    detail: type.shortDetail || type.detail || "", period: st.period || 0, clock: st.displayClock || "",
+    playoff: !!e.season && e.season.type === 3,
+    preseason: !!e.season && e.season.type === 1,
     broadcasts: (comp.broadcasts || []).flatMap((b) => b.names || []),
     headline: (comp.notes || []).map((n) => n.headline).filter(Boolean)[0] || "",
   };
   if (LEAGUES[key].kind === "fight") {
+    // ESPN lists the card with the main event last, so the last bout is the main event.
     return { ...base, name: e.name, fights: (e.competitions || []).map(normalizeFight) };
   }
-  const competitors = comp.competitors || [];
-  const home = competitors.find((c) => c.homeAway === "home") || {};
-  const away = competitors.find((c) => c.homeAway === "away") || {};
+  const sides = comp.competitors || [];
+  const home = sides.find((c) => c.homeAway === "home") || {};
+  const away = sides.find((c) => c.homeAway === "away") || {};
   const o = (comp.odds || [])[0] || null;
   return {
     ...base,
     away: normalizeTeam(away), home: normalizeTeam(home),
     odds: o && {
       provider: (o.provider && o.provider.name) || "",
-      details: o.details || "", spread: o.spread ?? null, total: o.overUnder ?? null,
+      spread: o.spread ?? null,                    // home team's spread (NFL, NBA)
+      total: o.overUnder ?? null,
       homeML: priceOf(o.moneyline && o.moneyline.home), awayML: priceOf(o.moneyline && o.moneyline.away),
+      openHomeML: priceOf(o.moneyline && o.moneyline.home, "open"), openAwayML: priceOf(o.moneyline && o.moneyline.away, "open"),
+      openSpread: lineOf(o.pointSpread && o.pointSpread.home, "open"), openTotal: lineOf(o.total && o.total.over, "open"),
+      total_close: lineOf(o.total && o.total.over, "close"),
+      runline: key === "mlb" ? {
+        homeLine: lineOf(o.pointSpread && o.pointSpread.home, "close"), homeOdds: priceOf(o.pointSpread && o.pointSpread.home),
+      } : null,
     },
   };
 }
-// ESPN gives moneylines as text such as "-395" under moneyline.home.current (or .close). EVEN means +100.
-function priceOf(side) {
-  const raw = side && ((side.current && side.current.odds) || (side.close && side.close.odds));
+// ESPN gives prices as text such as "-395" under moneyline.home.close.odds (or .open). EVEN means +100.
+function priceOf(side, which = "close") {
+  if (!side) return null;
+  const node = which === "open" ? side.open : (side.current || side.close);
+  const raw = node && node.odds;
   if (raw == null) return null;
   if (String(raw).toUpperCase() === "EVEN") return 100;
   const n = Number(String(raw).replace("+", ""));
   return Number.isFinite(n) && Math.abs(n) >= 100 ? n : null;
 }
+function lineOf(side, which = "close") {
+  if (!side) return null;
+  const node = which === "open" ? side.open : (side.current || side.close);
+  const n = node && node.line != null ? Number(String(node.line).replace(/^[ou]/i, "")) : null;
+  return Number.isFinite(n) ? n : null;
+}
 function normalizeTeam(c) {
   const t = c.team || {};
   return {
     name: t.displayName || t.shortDisplayName || "TBD", abbr: t.abbreviation || "",
-    logo: t.logo || "", score: c.score ?? null, record: (c.records || [])[0]?.summary || "", winner: !!c.winner,
+    logo: t.logo || (t.logos && t.logos[0] && t.logos[0].href) || "", logoAlt: t.logoDark || "",
+    score: c.score ?? null, record: (c.records || [])[0]?.summary || "", winner: !!c.winner,
   };
 }
 function normalizeFight(c) {
@@ -98,15 +114,43 @@ function normalizeFight(c) {
   return { id: c.id, a: side(f[0] || {}), b: side(f[1] || {}), state: c.status?.type?.state || "pre", detail: c.status?.type?.shortDetail || "", method: c.status?.type?.description || "", weight: c.type?.text || "" };
 }
 
+/* History files and the Kalshi proxy (both read-only) */
+const modelCache = {};
+async function loadHistory(key) {
+  if (!modelCache[key]) {
+    modelCache[key] = fetch(`data/${key}.json`).then((r) => {
+      if (!r.ok) throw new Error(`history file data/${key}.json is missing`);
+      return r.json();
+    }).then((d) => ({ ...d, rows: d.games.map((g) => ({ date: g[0], home: g[1], away: g[2], hs: g[3], as: g[4], type: g[5], season: g[6] })) }));
+  }
+  return modelCache[key];
+}
+const kalshiProxy = () => (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
+async function kalshiMarkets(key) {
+  return getJSON(`${kalshiProxy()}/markets?league=${key}`, { maxAgeMs: 30000 });
+}
+async function kalshiHistory(ticker, days = 7) {
+  return getJSON(`${kalshiProxy()}/history?ticker=${encodeURIComponent(ticker)}&days=${days}`, { maxAgeMs: 120000 });
+}
+
 /* ---------- helpers ---------- */
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtTime = (iso) => new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(iso));
 const fmtDay = (iso) => new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "long", month: "short", day: "numeric" }).format(new Date(iso));
-const fmtClock = (t) => new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(t));
+const todayKey = () => dayKey(new Date());
+const signedNum = (n) => (n == null ? "—" : (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n));
 const american = (n) => (n == null ? "—" : (n > 0 ? "+" : "") + n);
+const pctTxt = (p) => (p == null ? "—" : Math.round(p * 100) + "%");
 function settings() { try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; } catch (e) { return { ...DEFAULTS }; } }
-function saveSettings(s) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* private mode: keep going with defaults */ } }
+function saveSettings(s) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* private mode: keep going */ } }
+function daysBetween(a, b) { return (Date.parse(b) - Date.parse(a)) / 86400000; }
+function erf(x) {                                   // Abramowitz and Stegun 7.1.26
+  const s = Math.sign(x), t = 1 / (1 + 0.3275911 * Math.abs(x));
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return s * y;
+}
+const phi = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
 
 function isLive(ev) { return ev.state === "in"; }
 function isCloseLate(ev) {
@@ -121,46 +165,64 @@ function statusChip(ev) {
   if (ev.completed) return `<span class="chip final">Final</span>`;
   return `<span class="chip">${esc(fmtTime(ev.date))}</span>`;
 }
+// Logos: if one fails to load, the error handler below swaps in the team's abbreviation (after trying the dark-mode logo).
+function logoHtml(team) {
+  if (!team.logo) return `<span class="badge">${esc(team.abbr || "?")}</span>`;
+  return `<img class="logo" src="${esc(team.logo)}" data-alt="${esc(team.logoAlt || "")}" data-abbr="${esc(team.abbr || "?")}" alt="" loading="lazy">`;
+}
+document.addEventListener("error", (e) => {
+  const img = e.target;
+  if (!(img instanceof HTMLImageElement) || !img.classList.contains("logo")) return;
+  if (img.dataset.alt && img.src !== img.dataset.alt) { img.src = img.dataset.alt; return; }
+  const b = document.createElement("span");
+  b.className = "badge";
+  b.textContent = img.dataset.abbr || "?";
+  img.replaceWith(b);
+}, true);
 
 /* ---------- cards ---------- */
 function teamCard(ev) {
   const h = ev.home, a = ev.away;
   const row = (t) => `<div class="team ${t.winner ? "winner" : (ev.completed && !t.winner ? "loser" : "")}">
-      ${t.logo ? `<img src="${esc(t.logo)}" alt="" loading="lazy">` : `<span></span>`}
+      ${logoHtml(t)}
       <div><div class="name">${esc(t.name)}</div>${t.record ? `<div class="muted">${esc(t.record)}</div>` : ""}</div>
       <div class="score">${t.score == null || ev.state === "pre" ? "" : esc(t.score)}</div></div>`;
   const o = ev.odds;
-  const lines = o ? `<div class="lines">
-      <span>Spread <b>${esc(o.details || "—")}</b></span>
-      <span>Total <b>${esc(o.total ?? "—")}</b></span>
-      <span>ML <b>${esc(american(o.awayML))} / ${esc(american(o.homeML))}</b></span>
-      <span class="muted">${esc(o.provider)}</span></div>` : `<div class="muted" style="margin-top:8px">No pregame odds listed</div>`;
-  const big = ev.playoff || isCloseLate(ev);
+  let lines = `<div class="muted" style="margin-top:8px">No pregame odds listed</div>`;
+  if (o) {
+    const spread = ev.league === "mlb" && o.runline
+      ? `Run line <b>${esc(h.abbr)} ${signedNum(o.runline.homeLine)}</b> <span class="muted">(${esc(american(o.runline.homeOdds))})</span>`
+      : `Spread <b>${esc(h.abbr)} ${signedNum(o.spread)}</b>`;
+    lines = `<div class="lines"><span>${spread}</span><span>Total <b>${esc(o.total ?? "—")}</b></span>
+      <span>ML <b>${esc(american(o.awayML))} / ${esc(american(o.homeML))}</b></span><span class="muted">${esc(o.provider)}</span></div>`;
+  }
+  const big = (ev.playoff || isCloseLate(ev)) && !ev.preseason;
   return `<a class="card game ${isLive(ev) ? "live" : ""} ${big ? "big" : ""}" href="#/game/${ev.league}/${esc(ev.id)}">
-    <div class="kicker"><span>${esc(LEAGUES[ev.league].name)}${ev.playoff ? " · Playoffs" : ""}</span>${statusChip(ev)}</div>
+    <div class="kicker"><span>${esc(LEAGUES[ev.league].name)}${ev.playoff ? " · Playoffs" : ""}${ev.preseason ? " · Preseason" : ""}</span>${statusChip(ev)}</div>
     ${ev.headline ? `<div class="muted">${esc(ev.headline)}</div>` : ""}
     <div class="teams">${row(a)}${row(h)}</div>${lines}</a>`;
 }
 function fightCard(ev) {
   const fights = ev.fights || [];
-  const main = fights[0];
+  const main = fights[fights.length - 1];                // last bout on ESPN's card is the main event
   return `<div class="card ${isLive(ev) ? "live" : ""}">
     <div class="kicker"><span>UFC · ${esc(ev.name)}</span>${isLive(ev) ? `<span class="chip live">LIVE</span>` : ""}</div>
-    ${main ? fightRow(main) : `<div class="muted">No fights listed.</div>`}
+    ${main ? `<div class="muted">Main event</div>${fightRow(main)}` : `<div class="muted">No fights listed.</div>`}
     <div class="muted" style="margin-top:8px">${esc(fmtTime(ev.date))} · ${fights.length} bouts · ${ev.completed ? "event complete" : "upcoming"}</div></div>`;
 }
 function fightRow(f) {
   const side = (x) => `<div class="team ${x.winner ? "winner" : (f.state === "post" && !x.winner ? "loser" : "")}">
-    ${x.logo ? `<img src="${esc(x.logo)}" alt="" loading="lazy">` : `<span></span>`}<div><div class="name">${esc(x.name)}</div><div class="muted">${esc(x.record)}</div></div><span></span></div>`;
+    ${x.logo ? `<img class="logo" src="${esc(x.logo)}" alt="" loading="lazy">` : `<span class="badge">UFC</span>`}<div><div class="name">${esc(x.name)}</div><div class="muted">${esc(x.record)}</div></div><span></span></div>`;
   return `<div class="teams">${side(f.a)}${side(f.b)}</div><div class="muted" style="margin-top:6px">${esc(f.weight)}${f.method ? ` · ${esc(f.method)}` : ""} ${f.detail ? `· ${esc(f.detail)}` : ""}</div>`;
 }
 
-/* ---------- pages ---------- */
+/* ---------- pages: Home, leagues, game ---------- */
 async function pageHome() {
   const all = (await Promise.all(Object.keys(LEAGUES).map((k) => scoreboard(k).catch(() => [])))).flat();
   const teamEvents = all.filter((e) => LEAGUES[e.league].kind === "team");
   const playoffs = teamEvents.filter((e) => e.playoff);
-  const primetime = teamEvents.filter((e) => !e.playoff && e.broadcasts.some((b) => NATIONAL_NETWORKS.some((n) => b.includes(n))) && centralHour(e.date) >= 18 && !e.completed);
+  const primetime = teamEvents.filter((e) => !e.playoff && !e.preseason && !e.completed
+    && e.broadcasts.some((b) => NATIONAL_NETWORKS.some((n) => b.includes(n))) && centralHour(e.date) >= 18);
   const close = teamEvents.filter(isCloseLate);
   const ufc = all.filter((e) => e.league === "ufc").slice(0, 1);
   const section = (title, items, render) => items.length ? `<h2>${title}</h2><div class="grid two">${items.map(render).join("")}</div>` : "";
@@ -168,9 +230,9 @@ async function pageHome() {
     section("Live and close late", close, teamCard),
     section("Playoffs", playoffs, teamCard),
     section("Primetime national TV", primetime.slice(0, 6), teamCard),
-    section("UFC featured", ufc, fightCard),
+    section("UFC main event", ufc, fightCard),
   ].join("");
-  return `<h1>Big games</h1><p class="muted">Playoffs, primetime national TV, UFC featured fight, and live games that are close late. Primetime uses the national network list and an evening Central start time; it's approximate.</p>
+  return `<h1>Big games</h1><p class="muted">Playoffs, primetime national TV (regular season only), the UFC main event, and live games close late. The primetime test uses a list of national networks and an evening Central start; it's approximate.</p>
     ${html || `<div class="empty">Nothing big right now. Check the league tabs for today's games.</div>`}`;
 }
 
@@ -183,13 +245,11 @@ async function pageLeague(key) {
   }
   if (!events.length) return `<h1>${meta.name}</h1><div class="empty">No ${meta.name} games listed for the next 7 days.</div>`;
   const byDay = {};
-  for (const e of events) (byDay[centralDayKey(e.date)] ||= []).push(e);
-  const days = Object.keys(byDay).sort();
-  const todayKey = centralDayKey(new Date().toISOString());
+  for (const e of events) (byDay[dayKey(new Date(e.date))] ||= []).push(e);
   return `<h1>${meta.name}</h1><p class="muted">Today and the next 7 days, Central time.</p>
-    ${days.map((d) => {
+    ${Object.keys(byDay).sort().map((d) => {
       const list = byDay[d];
-      const label = d === todayKey ? "Today" : fmtDay(list[0].date);
+      const label = d === todayKey() ? "Today" : fmtDay(list[0].date);
       return `<h2>${esc(label)}</h2><div class="grid two">${list.map(teamCard).join("")}</div>`;
     }).join("")}`;
 }
@@ -208,7 +268,6 @@ async function pageGame(key, id) {
   const leaders = (s.leaders || []).map((t) => `<div class="card"><h3>${esc(t.team?.displayName || "")}</h3>
       ${(t.leaders || []).map((cat) => { const l = (cat.leaders || [])[0] || {}; return `<div class="lines"><span>${esc(cat.displayName || cat.name || "")}</span><b>${esc(l.athlete?.displayName || "")}</b><span>${esc(l.displayValue || "")}</span></div>`; }).join("")}
       </div>`).join("");
-
   const groups = (s.boxscore?.players || []).map((team) => (team.statistics || []).map((grp) => {
     const labels = grp.labels || grp.keys || [];
     const rows = (grp.athletes || []).map((a) => `<tr><td>${esc(a.athlete?.displayName || "")}</td>${(a.stats || []).map((v) => `<td>${esc(v)}</td>`).join("")}</tr>`).join("");
@@ -216,18 +275,17 @@ async function pageGame(key, id) {
   }).join("")).join("");
   const teamStats = (s.boxscore?.teams || []).map((t) => `<div class="card"><h3>${esc(t.team?.displayName || "")}</h3>${(t.statistics || []).map((x) => `<div class="lines"><span>${esc(x.label)}</span><b>${esc(x.displayValue)}</b></div>`).join("")}</div>`).join("");
   const inj = (s.injuries || []).map((t) => `<div class="card"><h3>${esc(t.displayName || t.team?.displayName || "")}</h3>${(t.injuries || []).map((i) => `<div class="lines"><span>${esc(i.athlete?.displayName || "")}</span><b>${esc(i.status || i.type?.description || "")}</b></div>`).join("") || `<span class="muted">No injuries listed</span>`}</div>`).join("");
-
   const chart = wp.length > 1 ? winChart(wp) : `<div class="empty">Win probability history appears once the game has started.</div>`;
   return `<a href="#/${key}">← ${meta.name}</a>
     <h1>${esc(away.team?.displayName || "")} at ${esc(home.team?.displayName || "")}</h1>
     <p class="muted">${esc(st.shortDetail || st.detail || "")}${header.date ? ` · ${esc(fmtTime(header.date))}` : ""}</p>
     <div class="card"><div class="teams">
-      <div class="team"><span></span><div class="name">${esc(away.team?.displayName || "")}</div><div class="score">${esc(away.score ?? "")}</div></div>
-      <div class="team"><span></span><div class="name">${esc(home.team?.displayName || "")}</div><div class="score">${esc(home.score ?? "")}</div></div>
+      <div class="team"><span class="badge">${esc(away.team?.abbreviation || "A")}</span><div class="name">${esc(away.team?.displayName || "")}</div><div class="score">${esc(away.score ?? "")}</div></div>
+      <div class="team"><span class="badge">${esc(home.team?.abbreviation || "H")}</span><div class="name">${esc(home.team?.displayName || "")}</div><div class="score">${esc(home.score ?? "")}</div></div>
     </div>
     ${wpLast != null ? `<div class="wpbar"><i class="a" style="width:${((1 - wpLast) * 100).toFixed(1)}%"></i><i class="h" style="width:${(wpLast * 100).toFixed(1)}%"></i></div>
     <div class="wplabel"><span>${esc(away.team?.abbreviation || "Away")} ${((1 - wpLast) * 100).toFixed(0)}%</span><span>${esc(home.team?.abbreviation || "Home")} ${(wpLast * 100).toFixed(0)}%</span></div>
-    <p class="muted" style="margin:6px 0 0">ESPN's live win probability. Tap a chart point below for the history.</p>` : `<p class="muted">Win probability not available for this game.</p>`}
+    <p class="muted" style="margin:6px 0 0">ESPN's live win probability.</p>` : `<p class="muted">Win probability not available for this game.</p>`}
     </div>
     <h2>Win probability over time</h2>${chart}
     <h2>Key leaders</h2><div class="grid two">${leaders || `<div class="empty">Leaders appear once games start.</div>`}</div>
@@ -250,140 +308,389 @@ function winChart(vals) {
     <polyline points="${pts}" fill="none" stroke="#c79a00" stroke-width="2.5"/></svg>`;
 }
 
-async function pageMarkets() {
-  const all = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k).catch(() => [])))).flat();
-  const rows = all.filter((e) => e.odds && e.odds.homeML != null && e.odds.awayML != null && !e.completed).slice(0, 40).map((e) => {
-    const fair = noVig(e.odds.awayML, e.odds.homeML);
-    return `<tr><td>${esc(LEAGUES[e.league].name)}</td><td>${esc(e.away.abbr)} @ ${esc(e.home.abbr)}</td><td>${esc(fmtTime(e.date))}</td>
-      <td>${esc(american(e.odds.awayML))} / ${esc(american(e.odds.homeML))}</td><td>${(fair.away * 100).toFixed(1)}% / ${(fair.home * 100).toFixed(1)}%</td></tr>`;
-  });
-  const kalshi = await kalshiSection(all);
-  return `<h1>Markets</h1>
-    <p class="muted">Sportsbook moneylines from ESPN, with the vig (bookmaker margin) removed. These are odds comparisons, not recommendations.</p>
-    ${kalshi}
-    <h2>Sportsbook moneylines (no-vig)</h2>
-    ${rows.length ? `<div class="scroll"><table class="stat-table"><thead><tr><th>League</th><th>Game</th><th>Start</th><th>ML (away / home)</th><th>No-vig % (away / home)</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : `<div class="empty">No moneylines listed for upcoming games right now.</div>`}`;
+/* ---------- Predictions: power ratings from history, live update from the score ---------- */
+// Per league: how fast old games fade (half-life in days), how much to shrink small samples, and the spread of final margins.
+const MODEL = {
+  nfl: { halfLife: 180, shrink: 8, sigma: 13.5, totalSigma: 13.5, minGames: [4, 8] },
+  nba: { halfLife: 120, shrink: 12, sigma: 12.5, totalSigma: 15, minGames: [12, 30] },
+};
+// Weighted points-for and points-against per team (recent games count more), turned into offense and defense ratings.
+// Output: expected points for each side, margin, total. Home-field advantage is the league's average home margin.
+function buildRatings(key, hist) {
+  const cfg = MODEL[key];
+  const asOf = todayKey();
+  const current = Math.max(...hist.rows.map((r) => r.season));
+  const teams = {};
+  const T = (t) => (teams[t] ||= { w: 0, pf: 0, pa: 0, gp: 0 });
+  let sw = 0, sm = 0, hfaSum = 0, n = 0;
+  for (const g of hist.rows) {
+    if (g.date > asOf) continue;
+    const w = Math.pow(0.5, daysBetween(g.date, asOf) / cfg.halfLife);
+    const h = T(g.home), a = T(g.away);
+    h.w += w; a.w += w; h.pf += w * g.hs; h.pa += w * g.as; a.pf += w * g.as; a.pa += w * g.hs;
+    if (g.season === current) { h.gp++; a.gp++; }
+    sw += w; sm += w * (g.hs + g.as) / 2; hfaSum += w * (g.hs - g.as); n++;
+  }
+  const mu = sw ? sm / sw : 0, hfa = sw ? hfaSum / sw : 0;
+  for (const t of Object.values(teams)) {
+    t.off = (t.pf - t.w * mu) / (t.w + cfg.shrink);
+    t.def = (t.pa - t.w * mu) / (t.w + cfg.shrink);
+  }
+  return { mu, hfa, teams, current, cfg, games: n };
 }
-// Remove the bookmaker margin: convert both American prices to implied probability, then scale so they sum to 1.
+function h2hRows(hist, current, a, b) {
+  return hist.rows.filter((g) => g.season >= current - 2 && ((g.home === a && g.away === b) || (g.home === b && g.away === a)));
+}
+// Pregame prediction for one upcoming game. Margin is from the home team's side.
+function predictGame(key, ratings, hist, ev) {
+  const H = ratings.teams[ev.home.abbr] || { off: 0, def: 0, gp: 0 };
+  const A = ratings.teams[ev.away.abbr] || { off: 0, def: 0, gp: 0 };
+  const eh = ratings.mu + H.off + A.def + ratings.hfa / 2;
+  const ea = ratings.mu + A.off + H.def - ratings.hfa / 2;
+  const base = eh - ea;
+  // Head-to-head: counts, but lightly (at most 2 points either way).
+  const meets = h2hRows(hist, ratings.current, ev.home.abbr, ev.away.abbr);
+  const h2hMargin = meets.length ? meets.reduce((s, g) => s + (g.home === ev.home.abbr ? g.hs - g.as : g.as - g.hs), 0) / meets.length : null;
+  const h2hAdj = h2hMargin == null ? 0 : Math.max(-2, Math.min(2, 0.15 * (h2hMargin - base)));
+  const margin = base + h2hAdj;
+  const sigma = ratings.cfg.sigma;
+  const gp = Math.min(H.gp, A.gp);
+  const [lo, hi] = ratings.cfg.minGames;
+  const confidence = gp >= hi ? "High" : gp >= lo ? "Medium" : "Low";
+  return {
+    pct: phi(margin / sigma), margin, spreadHome: Math.round(-margin * 2) / 2, total: eh + ea,
+    eh, ea, H, A, h2hMargin, h2hAdj, meets: meets.length, gp, confidence, sigma, hfa: ratings.hfa, earlySeason: gp < lo,
+  };
+}
+// Live update: remaining game share scales the pregame margin, and the score so far counts fully.
+function minutesLeftFraction(ev) {
+  const L = LEAGUES[ev.league];
+  if (!L.length || ev.period < 1) return null;
+  const parts = String(ev.clock || "").split(":").map(Number);
+  if (parts.length !== 2 || parts.some((x) => !Number.isFinite(x))) return null;
+  const clockMin = parts[0] + parts[1] / 60;
+  const left = ev.period <= L.periods ? (L.periods - ev.period) * L.period + clockMin : clockMin;
+  return Math.max(0, Math.min(1, left / L.length));
+}
+function liveWinPct(pred, ev) {
+  const f = minutesLeftFraction(ev);
+  if (f == null || !isLive(ev) || ev.home.score == null) return null;
+  const d = Number(ev.home.score) - Number(ev.away.score);
+  if (f === 0) return d > 0 ? 1 : d < 0 ? 0 : 0.5;
+  return phi((d + pred.margin * f) / (pred.sigma * Math.sqrt(f)));
+}
+// Sportsbook no-vig probability for the home team, from the moneylines (vig removed).
 function impliedFromAmerican(a) { return a > 0 ? 100 / (a + 100) : -a / (-a + 100); }
 function noVig(awayML, homeML) {
   const p = impliedFromAmerican(awayML), q = impliedFromAmerican(homeML), t = p + q;
   return { away: p / t, home: q / t };
 }
+const bookHome = (ev) => (ev.odds && ev.odds.homeML != null && ev.odds.awayML != null ? noVig(ev.odds.awayML, ev.odds.homeML).home : null);
 
-/* Kalshi: prices come from the Cloudflare Worker proxy (Kalshi blocks direct browser requests). */
-const KALSHI_LEAGUES = ["nfl", "nba", "mlb", "ufc"];
-async function kalshiSection(espnEvents) {
-  const proxy = (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
-  if (!proxy) return `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings.</div>`;
-  const got = await Promise.all(KALSHI_LEAGUES.map((k) => getJSON(`${proxy}/markets?league=${k}`, { maxAgeMs: 30000 })
-    .then((d) => ({ k, d })).catch((e) => ({ k, err: e.message }))));
-  const teams = espnEvents.filter((e) => e.home && e.away);
-  let out = "";
-  for (const { k, d, err } of got) {
-    if (err) { out += `<div class="note warn">${esc(LEAGUES[k].name)} Kalshi prices unavailable: ${esc(err)}</div>`; continue; }
-    const groups = {};
-    for (const m of d.markets || []) (groups[m.event] ||= []).push(m);
-    const events = Object.values(groups);
-    out += `<h2>${esc(LEAGUES[k].name)} on Kalshi</h2>`;
-    out += events.length
-      ? `<p class="muted">Kalshi data from ${esc(fmtTime(d.fetched_at))}. Prices are the Yes price in cents.</p><div class="grid two">${events.map((ms) => kalshiCard(k, ms, teams)).join("")}</div>`
-      : `<div class="empty">No open ${esc(LEAGUES[k].name)} markets on Kalshi right now.</div>`;
+// Predictions only for NFL and NBA in Phase 1. Returns { [eventId]: prediction }.
+async function predictionsFor(events) {
+  const out = {};
+  for (const key of ["nfl", "nba"]) {
+    const mine = events.filter((e) => e.league === key && !e.completed && !e.preseason);
+    if (!mine.length) continue;
+    const hist = await loadHistory(key);
+    const ratings = buildRatings(key, hist);
+    for (const ev of mine) {
+      const p = predictGame(key, ratings, hist, ev);
+      out[ev.id] = { ...p, live: liveWinPct(p, ev), league: key };
+    }
   }
   return out;
 }
+
+async function pagePredictions() {
+  const threshold = settings().edgeThreshold;
+  const events = (await Promise.all(["nfl", "nba"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat();
+  const preds = await predictionsFor(events);
+  const list = events.filter((e) => preds[e.id]);
+  if (!list.length) return `<h1>Predictions</h1><div class="empty">No upcoming NFL or NBA games in the next 7 days.</div>`;
+  const sections = ["nfl", "nba"].map((k) => {
+    const games = list.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
+    if (!games.length) return "";
+    const rating = `${LEAGUES[k].name} · history ${k === "nfl" ? "2024–2026" : "2023–24 to 2025–26"}`;
+    return `<h2>${LEAGUES[k].name}</h2><p class="muted">${esc(rating)}. Each % is the chance the home team wins. Tap "Why" for the reasons.</p>
+      <div class="grid two">${games.map((e) => predictionCard(e, preds[e.id], threshold)).join("")}</div>`;
+  }).join("");
+  return `<h1>Predictions</h1>
+    <p class="muted">Statistical estimates from each team's recent points scored and allowed. Live games update from the score. Estimates are not guarantees.</p>
+    <div class="note">Injuries are not in these numbers yet. The Why panel lists them so you can judge.</div>
+    ${sections}`;
+}
+function predictionCard(ev, p, threshold) {
+  const homeNow = p.live != null ? p.live : p.pct;
+  const book = bookHome(ev);
+  const gap = book == null ? null : Math.round((p.pct - book) * 100);
+  const flag = gap != null && Math.abs(gap) >= threshold
+    ? `<span class="chip tag-medium">Differs from sportsbook by ${Math.abs(gap)} pts</span>` : "";
+  const conf = `<span class="chip tag-${p.confidence.toLowerCase()}">${p.confidence} confidence</span>${p.earlySeason ? ` <span class="chip">Early season</span>` : ""}`;
+  const id = `why-${ev.id}`;
+  return `<div class="card ${isLive(ev) ? "live" : ""}">
+    <div class="kicker"><span>${esc(LEAGUES[ev.league].name)}${ev.playoff ? " · Playoffs" : ""}</span>${statusChip(ev)}</div>
+    <div class="teams">
+      <div class="team">${logoHtml(ev.away)}<div><div class="name">${esc(ev.away.name)}</div></div><span></span></div>
+      <div class="team">${logoHtml(ev.home)}<div><div class="name">${esc(ev.home.name)}</div></div><span></span></div>
+    </div>
+    <div class="wpbar"><i class="a" style="width:${((1 - homeNow) * 100).toFixed(1)}%"></i><i class="h" style="width:${(homeNow * 100).toFixed(1)}%"></i></div>
+    <div class="wplabel"><span>${esc(ev.away.abbr)} ${((1 - homeNow) * 100).toFixed(0)}%</span><span>${esc(ev.home.abbr)} ${(homeNow * 100).toFixed(0)}%${p.live != null ? " (live)" : ""}</span></div>
+    <div class="lines"><span>Projected spread <b>${esc(ev.home.abbr)} ${signedNum(p.spreadHome)}</b></span><span>Projected total <b>${p.total.toFixed(1)}</b></span></div>
+    <div class="row" style="margin-top:8px">${conf} ${flag}</div>
+    <button class="toggle" style="margin-top:8px" data-why="${id}" type="button" aria-expanded="false">Why</button>
+    <div id="${id}" class="note" hidden>${whyHtml(ev, p)}</div>
+  </div>`;
+}
+function whyHtml(ev, p) {
+  const f = (x) => (x >= 0 ? "+" : "") + x.toFixed(1);
+  const book = bookHome(ev);
+  return `<div><b>Expected points</b>: ${esc(ev.home.abbr)} ${p.eh.toFixed(1)}, ${esc(ev.away.abbr)} ${p.ea.toFixed(1)}</div>
+    <div><b>Home-field advantage</b>: about ${p.hfa.toFixed(1)} points (league average home margin)</div>
+    <div><b>${esc(ev.home.abbr)} offense / defense</b>: ${f(p.H.off)} / ${f(-p.H.def)} points vs league average (defense shown as points saved)</div>
+    <div><b>${esc(ev.away.abbr)} offense / defense</b>: ${f(p.A.off)} / ${f(-p.A.def)} points vs league average</div>
+    <div><b>Games this season</b>: ${p.gp} for the less-played team (${p.confidence} confidence)</div>
+    <div><b>Head to head</b>: ${p.meets ? `${p.meets} recent meeting(s), average home margin ${p.h2hMargin.toFixed(1)}; adjusted by ${f(p.h2hAdj)} points` : "no recent meetings in the history"}</div>
+    <div><b>Sportsbook (no vig)</b>: ${book == null ? "not listed" : pctTxt(book) + " home"}</div>
+    <div><b>Live</b>: ${p.live != null ? `${pctTxt(p.live)} home, from the current score and time left` : "starts when the game does"}</div>
+    <div class="muted" style="margin-top:6px">Not included yet: injuries, weather, rest, and starting quarterbacks. Margins vary by about ${p.sigma} points, so a 60% estimate is close to a coin flip.</div>`;
+}
+
+/* ---------- Markets: Kalshi-style rows with trend charts and sportsbook sources ---------- */
+// Sportsbook and BananaBets numbers are shown next to the Kalshi Yes price.
 function nameMatch(outcome, teamName) {
   return !!outcome && teamName.toLowerCase().includes(outcome.toLowerCase());
 }
-function sportsbookShare(game, outcome) {
-  if (!game.odds || game.odds.homeML == null || game.odds.awayML == null) return null;
-  const fair = noVig(game.odds.awayML, game.odds.homeML);
-  if (nameMatch(outcome, game.away.name)) return fair.away;
-  if (nameMatch(outcome, game.home.name)) return fair.home;
-  return null;
-}
-// Only compare with a sportsbook game that has BOTH teams and starts near the Kalshi close time (same team can meet again weeks later).
-function findGame(k, ms, teams) {
-  const closeT = ms.map((m) => m.close_time).find(Boolean);
-  const names = ms.map((m) => m.outcome);
-  return teams.find((e) => e.league === k
+function kalshiGroupKey(m) { return (m.event || "").split("-").slice(1).join("-"); }
+function findGame(league, wins, teams) {
+  const closeT = wins.map((m) => m.close_time).find(Boolean);
+  const names = wins.map((m) => m.outcome);
+  return teams.find((e) => e.league === league
     && names.some((n) => nameMatch(n, e.away.name)) && names.some((n) => nameMatch(n, e.home.name))
     && (!closeT || Math.abs(new Date(e.date) - new Date(closeT)) < 6 * 86400000));
 }
-function kalshiCard(k, ms, teams) {
-  const game = findGame(k, ms, teams);
-  const rows = ms.map((m) => {
-    const p = m.last ?? (m.yes_bid != null && m.yes_ask != null ? (m.yes_bid + m.yes_ask) / 2 : null);
-    const move = m.last != null && m.previous != null ? Math.round((m.last - m.previous) * 100) : 0;
-    const arrow = move > 0 ? `▲ ${move}¢` : move < 0 ? `▼ ${-move}¢` : "no change";
-    const book = sportsbookShare(game || { odds: null }, m.outcome);
-    return `<div class="lines"><span><b>${esc(m.outcome)}</b></span><span>Kalshi <b>${p == null ? "—" : Math.round(p * 100) + "¢"}</b></span>
-      <span class="muted">${esc(arrow)}</span><span>Sportsbook <b>${book == null ? "—" : (book * 100).toFixed(0) + "%"}</b></span></div>`;
-  }).join("");
-  const title = ms.map((m) => m.outcome).join(" vs ");
-  return `<div class="card"><div class="kicker"><span>${esc(title)}</span></div>${rows}
-    ${game ? "" : `<div class="muted" style="margin-top:6px">No matching ESPN game, so no sportsbook comparison.</div>`}</div>`;
+// Which team an outcome refers to. Spread titles start with the city ("Seattle wins by over 7.5 points"), so fall back to the city.
+function cityOf(name) { return name.split(" ").slice(0, -1).join(" ").toLowerCase(); }
+function sideOf(outcome, game) {
+  if (!game) return null;
+  const exact = [nameMatch(outcome, game.home.name), nameMatch(outcome, game.away.name)];
+  if (exact[0] !== exact[1]) return exact[0] ? "home" : "away";
+  const o = outcome.toLowerCase();
+  const city = [cityOf(game.home.name), cityOf(game.away.name)].map((c) => c && o.startsWith(c));
+  if (city[0] !== city[1]) return city[0] ? "home" : "away";
+  return null;
+}
+function pct(x) { return x == null ? "—" : Math.round(x * 100) + "%"; }
+function cents(x) { return x == null ? "—" : Math.round(x * 100) + "¢"; }
+function yesPrice(m) {
+  if (m.last != null) return m.last;
+  if (m.yes_bid != null && m.yes_ask != null) return (m.yes_bid + m.yes_ask) / 2;
+  return null;
+}
+function sparkline(points) {
+  if (!points || points.length < 2) return `<div class="muted">Not enough trade history yet.</div>`;
+  const w = 320, h = 60;
+  const xs = points.map((_, i) => (i / (points.length - 1)) * (w - 4) + 2);
+  const ys = points.map((p) => h - 4 - p.p * (h - 8));
+  const pts = points.map((_, i) => `${xs[i].toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
+  const first = points[0].p, last = points[points.length - 1].p;
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" role="img" aria-label="Yes price trend, from ${Math.round(first * 100)} to ${Math.round(last * 100)} cents">
+    <polyline points="${pts}" fill="none" stroke="#c79a00" stroke-width="2"/></svg>
+    <div class="muted">Yes ${Math.round(first * 100)}¢ → ${Math.round(last * 100)}¢ over the last week</div>`;
+}
+async function kalshiSection(espnEvents, preds) {
+  if (!kalshiProxy()) return `<div class="note warn">Kalshi prices aren't connected yet. Follow worker/SETUP.md, then paste your proxy address in Settings.</div>`;
+  let out = "";
+  for (const key of ["nfl", "nba", "mlb", "ufc"]) {
+    let data;
+    try { data = await kalshiMarkets(key); } catch (e) { out += `<div class="note warn">${esc(LEAGUES[key].name)} Kalshi prices unavailable: ${esc(e.message)}</div>`; continue; }
+    const groups = {};
+    for (const m of data.markets || []) (groups[kalshiGroupKey(m)] ||= []).push(m);
+    out += `<h2>${esc(LEAGUES[key].name)} on Kalshi</h2>`;
+    const keys = Object.keys(groups);
+    if (!keys.length) { out += `<div class="empty">No open ${esc(LEAGUES[key].name)} markets on Kalshi right now.</div>`; continue; }
+    const cards = keys.map((k) => marketsCard(key, groups[k], espnEvents, preds));
+    const matched = cards.filter((c) => c.matched).map((c) => c.html);
+    const other = cards.filter((c) => !c.matched).map((c) => c.html);
+    out += `<p class="muted">Kalshi data from ${esc(fmtTime(data.fetched_at))}. Yes prices are in cents, so 30¢ is a 30% chance.</p>`;
+    out += matched.length
+      ? `<div class="grid two">${matched.join("")}</div>`
+      : `<div class="empty">No ${esc(LEAGUES[key].name)} Kalshi markets match an ESPN game in the next 7 days.</div>`;
+    if (other.length) out += `<details class="more"><summary>${other.length} more ${esc(LEAGUES[key].name)} markets (no ESPN game in the next 7 days yet)</summary><div class="grid two">${other.join("")}</div></details>`;
+  }
+  return out;
+}
+function marketsCard(league, ms, espnEvents, preds) {
+  const wins = ms.filter((m) => m.kind === "win");
+  const spreads = ms.filter((m) => m.kind === "spread");
+  const totals = ms.filter((m) => m.kind === "total");
+  const game = findGame(league, wins, espnEvents);
+  const title = game ? `${game.away.name} at ${game.home.name}` : wins.map((m) => m.outcome).join(" vs ");
+  const p = game && preds[game.id];
+  const threshold = settings().edgeThreshold;
+  const rowBase = (m, bb, book, flagText) => {
+    const y = yesPrice(m);
+    const id = `t-${m.ticker.replace(/[^A-Za-z0-9]/g, "")}`;
+    return `<div class="mrow">
+      <div class="mname"><b>${esc(m.outcome)}</b>${flagText ? ` <span class="chip tag-medium">${esc(flagText)}</span>` : ""}</div>
+      <div class="yesno"><span class="yes">Yes ${cents(y)}</span><span class="no">No ${y == null ? "—" : Math.round((1 - y) * 100) + "¢"}</span></div>
+      <div class="src"><span>Kalshi <b>${pct(y)}</b></span><span>Sportsbook <b>${pct(book)}</b></span><span>BananaBets <b>${pct(bb)}</b></span></div>
+      <button class="ghost small" data-trend="${esc(m.ticker)}" data-target="${id}" type="button">Trend</button>
+      <div id="${id}" class="trend" hidden></div></div>`;
+  };
+  let html = `<div class="card"><div class="kicker"><span>${esc(title)}</span>${game ? `<span class="chip">${esc(fmtTime(game.date))}</span>` : `<span class="chip">no matching ESPN game</span>`}</div>`;
+  if (wins.length) {
+    html += `<div class="muted" style="margin-top:6px">Winner</div>`;
+    for (const m of wins) {
+      const side = sideOf(m.outcome, game);
+      const hb = game ? bookHome(game) : null;
+      const book = hb != null && side ? (side === "home" ? hb : 1 - hb) : null;
+      const bb = p && side ? (side === "home" ? p.pct : 1 - p.pct) : null;
+      const y = yesPrice(m);
+      const gap = bb != null && y != null ? Math.round((bb - y) * 100) : null;
+      const flag = gap != null && Math.abs(gap) >= threshold ? `${Math.abs(gap)} pt gap` : "";
+      html += rowBase(m, bb, book, flag);
+    }
+  }
+  if (spreads.length) {
+    html += `<div class="muted" style="margin-top:8px">Spread</div>`;
+    for (const m of spreads) {
+      const line = Number((m.outcome.match(/over ([\d.]+)/) || [])[1]);
+      const side = sideOf(m.outcome, game);
+      const sig = p ? p.sigma : null;
+      const bb = p && side && Number.isFinite(line) && sig
+        ? phi(((side === "home" ? p.margin : -p.margin) - line) / sig) : null;
+      html += rowBase(m, bb, null, "");
+    }
+  }
+  if (totals.length) {
+    html += `<div class="muted" style="margin-top:8px">Total</div>`;
+    for (const m of totals) {
+      const line = Number((m.outcome.match(/([\d.]+)/) || [])[1]);
+      const bb = p && Number.isFinite(line) ? phi((p.total - line) / MODEL[league].totalSigma) : null;
+      html += rowBase(m, bb, null, "");
+    }
+  }
+  if (game && game.odds) html += lineMovement(game);
+  if (game && game.state === "in") html += liveCover(game);
+  return { matched: !!game, html: html + `</div>` };
+}
+function lineMovement(game) {
+  const o = game.odds;
+  const row = (label, open, now, f) => `<tr><td>${label}</td><td>${open == null ? "—" : f(open)}</td><td>${now == null ? "—" : f(now)}</td></tr>`;
+  const ml = (x) => american(x);
+  return `<div class="muted" style="margin-top:10px">Line movement (opening vs latest)</div>
+    <div class="scroll"><table class="stat-table"><thead><tr><th>Market</th><th>Opening</th><th>Latest</th></tr></thead><tbody>
+      ${row(`${esc(game.home.abbr)} moneyline`, o.openHomeML, o.homeML, ml)}
+      ${row(`${esc(game.away.abbr)} moneyline`, o.openAwayML, o.awayML, ml)}
+      ${row(`${esc(game.home.abbr)} spread`, o.openSpread, o.spread, signedNum)}
+      ${row("Total", o.openTotal, o.total, (x) => x)}
+    </tbody></table></div>`;
+}
+function liveCover(game) {
+  const f = minutesLeftFraction(game);
+  const d = Number(game.home.score) - Number(game.away.score);
+  const parts = [];
+  if (game.odds && game.odds.spread != null) {
+    const covering = d + game.odds.spread > 0 ? game.home.abbr : d + game.odds.spread < 0 ? game.away.abbr : "push";
+    parts.push(`<span>Spread: <b>${esc(covering)} ${covering === "push" ? "" : "covering"}</b> (${esc(game.home.abbr)} ${signedNum(game.odds.spread)})</span>`);
+  }
+  if (game.odds && game.odds.total != null && f != null && f < 1) {
+    const elapsed = 1 - f;
+    const total = Number(game.home.score) + Number(game.away.score);
+    if (elapsed > 0) {
+      const pace = total / elapsed;
+      parts.push(`<span>Total pace: <b>${pace.toFixed(1)}</b> vs line ${esc(game.odds.total)} → <b>${pace > game.odds.total ? "over" : "under"} pace</b></span>`);
+    }
+  }
+  return `<div class="lines" style="margin-top:8px">${parts.join("") || `<span class="muted">Live spread and total tracking needs odds.</span>`}</div>`;
+}
+async function pageMarkets() {
+  const all = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat();
+  const preds = await predictionsFor(all);
+  const kalshi = await kalshiSection(all, preds);
+  const rows = all.filter((e) => e.odds && e.odds.homeML != null && e.odds.awayML != null && !e.completed).slice(0, 40).map((e) => {
+    const fair = noVig(e.odds.awayML, e.odds.homeML);
+    return `<tr><td>${esc(LEAGUES[e.league].name)}</td><td>${esc(e.away.abbr)} @ ${esc(e.home.abbr)}</td><td>${esc(fmtTime(e.date))}</td>
+      <td>${esc(american(e.odds.awayML))} / ${esc(american(e.odds.homeML))}</td><td>${(fair.away * 100).toFixed(1)}% / ${(fair.home * 100).toFixed(1)}%</td></tr>`;
+  });
+  return `<h1>Markets</h1>
+    <p class="muted">Kalshi Yes/No prices next to sportsbook odds (vig removed) and BananaBets' estimate. Kalshi prices are read-only. This is a comparison, not a recommendation.</p>
+    ${kalshi}
+    <h2>Sportsbook moneylines (no vig)</h2>
+    ${rows.length ? `<div class="scroll"><table class="stat-table"><thead><tr><th>League</th><th>Game</th><th>Start</th><th>ML (away / home)</th><th>No-vig % (away / home)</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : `<div class="empty">No moneylines listed for upcoming games right now.</div>`}`;
 }
 
-function pagePredictions() {
-  return `<h1>Predictions</h1><div class="empty">Predictions aren't built yet. This is the next Phase 1 step: NFL and NBA power ratings, with the win %, projected spread and total, and a confidence tag.</div>`;
-}
+/* ---------- Record, Settings ---------- */
 function pageRecord() {
-  return `<h1>Track record</h1><div class="empty">Nothing logged yet. Predictions and saved picks will be graded here once the prediction model is in place.</div>`;
+  return `<h1>Track record</h1><div class="empty">Nothing logged yet. Predictions and saved picks will be graded here once the track record is built (next phase).</div>`;
 }
 function pageSettings() {
   const s = settings();
   return `<h1>Settings</h1>
     <label class="field"><span>Flag gaps of at least (points)</span><input id="edge" type="number" min="1" max="30" step="0.5" value="${esc(s.edgeThreshold)}"></label>
-    <p class="muted">Used by the Markets and Predictions tabs once they're built. Default is 5.</p>
+    <p class="muted">Used on Predictions and Markets. Default is 5.</p>
     <label class="field"><span>Kalshi proxy address</span><input id="kproxy" type="text" placeholder="https://bananabets-kalshi.YOUR-NAME.workers.dev" value="${esc(s.kalshiProxy)}" style="width:min(320px,60vw)"></label>
     <p class="muted">Paste the Cloudflare Worker address from worker/SETUP.md. Leave blank to skip Kalshi.</p>
     <h2>Data sources</h2>
     <div class="card"><b>ESPN public site API</b><div class="muted">Scores, schedules, stats, odds, win probability, injuries. Unofficial; may change without notice.</div></div>
-    <div class="card" style="margin-top:10px"><b>Kalshi</b><div class="muted">Not connected yet.</div></div>
+    <div class="card" style="margin-top:10px"><b>Kalshi</b><div class="muted">Read-only prices through your Cloudflare Worker.</div></div>
+    <div class="card" style="margin-top:10px"><b>Game history</b><div class="muted">data/nfl.json and data/nba.json, rebuilt weekly by a GitHub Action from ESPN.</div></div>
     <div class="card" style="margin-top:10px"><b>Underdog</b><div class="muted">No public data. Lines would be typed in by hand.</div></div>
     <h2>Refresh</h2><p class="muted">Every 20 seconds while a game is live; every 5 minutes otherwise. The Refresh button updates now.</p>`;
 }
 
 /* ---------- router and refresh ---------- */
 const ROUTES = {
-  "": () => pageHome(),
   home: () => pageHome(),
   nfl: () => pageLeague("nfl"), nba: () => pageLeague("nba"), mlb: () => pageLeague("mlb"), ufc: () => pageLeague("ufc"),
   markets: () => pageMarkets(), predictions: () => pagePredictions(), record: () => pageRecord(), settings: () => pageSettings(),
 };
-let lastRoute = null;
-function currentRoute() {
-  const parts = (location.hash.replace(/^#\/?/, "") || "").split("/").filter(Boolean);
-  return parts;
-}
+function currentRoute() { return (location.hash.replace(/^#\/?/, "") || "").split("/").filter(Boolean); }
 async function render({ keepScroll = false } = {}) {
   const parts = currentRoute();
   const view = $("#view");
   const top = window.scrollY;
-  document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === (parts[0] || "home")));
+  const key = parts[0] || "home";
+  document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === key));
   try {
-    const key = parts[0] || "home";
     let html;
     if (key === "game" && parts[1] && parts[2]) html = await pageGame(parts[1], parts[2]);
     else if (ROUTES[key]) html = await ROUTES[key]();
     else html = `<h1>Not found</h1><p class="muted">Pick a tab above.</p>`;
     view.innerHTML = html;
-    const btn = $("#showall");
-    if (btn) btn.onclick = () => { const box = $("#allstats"); box.hidden = !box.hidden; btn.textContent = box.hidden ? "Show all stats" : "Hide stats"; btn.setAttribute("aria-expanded", String(!box.hidden)); };
-    const edge = $("#edge");
-    const kp = $("#kproxy");
-    if (kp) kp.onchange = () => saveSettings({ ...settings(), kalshiProxy: kp.value.trim() });
-    if (edge) edge.onchange =() => { const v = Math.max(1, Math.min(30, Number(edge.value) || 5)); saveSettings({ ...settings(), edgeThreshold: v }); edge.value = v; };
-    if (keepScroll) window.scrollTo(0, top);
-    else window.scrollTo(0, 0);
+    wireView();
+    if (keepScroll) window.scrollTo(0, top); else window.scrollTo(0, 0);
     setUpdated(new Date());
-    lastRoute = parts.join("/");
   } catch (e) {
     view.innerHTML = `<div class="note warn"><b>Couldn't load this data.</b> ${esc(e.message)}. Check your connection, then press Refresh.</div>`;
     setUpdated(null);
   }
   scheduleNext();
+}
+function wireView() {
+  const btn = $("#showall");
+  if (btn) btn.onclick = () => { const box = $("#allstats"); box.hidden = !box.hidden; btn.textContent = box.hidden ? "Show all stats" : "Hide stats"; btn.setAttribute("aria-expanded", String(!box.hidden)); };
+  document.querySelectorAll("[data-why]").forEach((b) => b.onclick = () => {
+    const box = document.getElementById(b.dataset.why); box.hidden = !box.hidden; b.setAttribute("aria-expanded", String(!box.hidden));
+  });
+  document.querySelectorAll("[data-trend]").forEach((b) => b.onclick = async () => {
+    const box = document.getElementById(b.dataset.target);
+    if (!box.hidden && box.dataset.loaded) { box.hidden = true; return; }
+    box.hidden = false;
+    if (box.dataset.loaded) return;
+    box.innerHTML = `<span class="muted">Loading trend…</span>`;
+    try {
+      const h = await kalshiHistory(b.dataset.trend, 7);
+      box.innerHTML = sparkline(h.points);
+      box.dataset.loaded = "1";
+    } catch (e) { box.innerHTML = `<span class="muted">Trend unavailable: ${esc(e.message)}</span>`; }
+  });
+  const edge = $("#edge");
+  if (edge) edge.onchange = () => { const v = Math.max(1, Math.min(30, Number(edge.value) || 5)); saveSettings({ ...settings(), edgeThreshold: v }); edge.value = v; };
+  const kp = $("#kproxy");
+  if (kp) kp.onchange = () => saveSettings({ ...settings(), kalshiProxy: kp.value.trim() });
 }
 function setUpdated(d) {
   $("#updated").textContent = d ? `Last updated ${new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" }).format(d)}` : "Update failed";

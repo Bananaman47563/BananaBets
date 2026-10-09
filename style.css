@@ -69,3 +69,25 @@ svg.wp text { font-size: 12px; fill: var(--muted); }
 label.field { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 input[type="number"], input[type="text"] { font: inherit; padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; width: 110px; background: #fff; }
 .foot { color: var(--muted); font-size: 12px; margin-top: 30px; padding-top: 14px; border-top: 1px solid var(--border); }
+
+/* badges (team abbreviation when a logo is missing) and logos */
+img.logo { width: 28px; height: 28px; object-fit: contain; flex: none; }
+.badge { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font-size: 10px; font-weight: 800; flex: none; }
+button.small { padding: 4px 10px; font-size: 13px; }
+
+/* Kalshi-style market rows */
+.mrow { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px 0; border-top: 1px solid var(--border); }
+.mrow:first-of-type { border-top: 0; }
+.mname { grid-column: 1; }
+.yesno { grid-column: 2; grid-row: 1; display: flex; gap: 6px; }
+.yesno .yes, .yesno .no { font-weight: 800; padding: 4px 10px; border-radius: 8px; font-size: 14px; font-variant-numeric: tabular-nums; }
+.yesno .yes { background: #e3f5ec; color: var(--good); }
+.yesno .no { background: #fde9e7; color: var(--bad); }
+.src { grid-column: 1; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; color: var(--muted); }
+.src b { color: var(--text); font-variant-numeric: tabular-nums; }
+.mrow > button { grid-column: 2; justify-self: end; }
+.trend { grid-column: 1 / -1; background: var(--surface-2); border-radius: 10px; padding: 8px 10px; }
+svg.spark { width: 100%; height: 60px; display: block; }
+.wplabel b { font-variant-numeric: tabular-nums; }
+details.more { margin: 14px 0; }
+details.more > summary { cursor: pointer; font-weight: 600; color: var(--muted); padding: 8px 0; }
