@@ -73,10 +73,17 @@ function normalizeEvent(key, e) {
     odds: o && {
       provider: (o.provider && o.provider.name) || "",
       details: o.details || "", spread: o.spread ?? null, total: o.overUnder ?? null,
-      homeML: o.homeTeamOdds && o.homeTeamOdds.moneyLine != null ? o.homeTeamOdds.moneyLine : null,
-      awayML: o.awayTeamOdds && o.awayTeamOdds.moneyLine != null ? o.awayTeamOdds.moneyLine : null,
+      homeML: priceOf(o.moneyline && o.moneyline.home), awayML: priceOf(o.moneyline && o.moneyline.away),
     },
   };
+}
+// ESPN gives moneylines as text such as "-395" under moneyline.home.current (or .close). EVEN means +100.
+function priceOf(side) {
+  const raw = side && ((side.current && side.current.odds) || (side.close && side.close.odds));
+  if (raw == null) return null;
+  if (String(raw).toUpperCase() === "EVEN") return 100;
+  const n = Number(String(raw).replace("+", ""));
+  return Number.isFinite(n) && Math.abs(n) >= 100 ? n : null;
 }
 function normalizeTeam(c) {
   const t = c.team || {};
@@ -121,7 +128,7 @@ function teamCard(ev) {
   const row = (t) => `<div class="team ${t.winner ? "winner" : (ev.completed && !t.winner ? "loser" : "")}">
       ${t.logo ? `<img src="${esc(t.logo)}" alt="" loading="lazy">` : `<span></span>`}
       <div><div class="name">${esc(t.name)}</div>${t.record ? `<div class="muted">${esc(t.record)}</div>` : ""}</div>
-      <div class="score">${t.score == null ? "" : esc(t.score)}</div></div>`;
+      <div class="score">${t.score == null || ev.state === "pre" ? "" : esc(t.score)}</div></div>`;
   const o = ev.odds;
   const lines = o ? `<div class="lines">
       <span>Spread <b>${esc(o.details || "—")}</b></span>
