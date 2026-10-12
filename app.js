@@ -458,13 +458,99 @@ async function predictionsFor(events) {
   return out;
 }
 
+/* ---------- Player over / under: the player's last 10 games from ESPN's game log ---------- */
+const playerState = { league: "nfl", query: "", player: null, stat: "", line: "", result: null, error: "", busy: false };
+async function findPlayer(league, query) {
+  const found = await getJSON(`https://site.web.api.espn.com/apis/common/v3/search?query=${encodeURIComponent(query)}&limit=25&type=player`, { maxAgeMs: 300000 });
+  const hit = (found.items || []).find((i) => i.league === league);
+  if (!hit) throw new Error(`No ${LEAGUES[league].name} player matches "${query}".`);
+  const log = await getJSON(`https://site.web.api.espn.com/apis/common/v3/sports/${LEAGUES[league].path}/athletes/${hit.id}/gamelog`, { maxAgeMs: 300000 });
+  const names = log.names || [], labels = log.displayNames || [];
+  const games = [];
+  for (const st of log.seasonTypes || []) for (const cat of st.categories || []) for (const e of cat.events || []) {
+    const ev = (log.events || {})[e.eventId] || {};
+    games.push({ date: ev.gameDate || "", stats: Object.fromEntries(names.map((n, i) => [n, e.stats[i]])) });
+  }
+  if (!games.length) throw new Error(`${hit.displayName} has no game log yet.`);
+  games.sort((a, b) => b.date.localeCompare(a.date));
+  // Counts only: drop percentages, averages, ratings and "made-attempted" pairs.
+  const stats = names.map((n, i) => ({ key: n, label: labels[i] || n })).filter((s) => !/pct|percent|rating|qbr|avg|per|long|-/i.test(s.key));
+  return { name: hit.displayName, games, stats };
+}
+// Chance of going over the line, using a normal curve around the average of the last 10 games.
+function overUnder(games, key, line) {
+  const vals = games.slice(0, 10).map((g) => g.stats[key]).filter((v) => v != null && String(v).trim() !== "" && Number.isFinite(Number(v))).map(Number);
+  if (vals.length < 3) return null;
+  const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+  const sample = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / (vals.length - 1));
+  const sd = Math.max(sample, Math.sqrt(mean), 0.5);   // counts vary at least as much as their square root
+  const over = 1 - phi((line - mean) / sd);
+  return { over, under: 1 - over, mean, sd, n: vals.length, last: vals.slice(0, 5) };
+}
+function playerCard() {
+  const ps = playerState;
+  const form = `<form id="pfind" class="pform">
+      <label class="field"><span>League</span><select id="pleague">${["nfl", "nba"].map((k) => `<option value="${k}"${ps.league === k ? " selected" : ""}>${LEAGUES[k].name}</option>`).join("")}</select></label>
+      <label class="field"><span>Player</span><input id="pname" type="text" value="${esc(ps.query)}" placeholder="e.g. Patrick Mahomes"></label>
+      <button class="ghost" type="submit"${ps.busy ? " disabled" : ""}>${ps.busy ? "Looking…" : "Find player"}</button></form>`;
+  let body = "";
+  if (ps.error) body += `<div class="note warn">${esc(ps.error)}</div>`;
+  if (ps.player) {
+    const p = ps.player;
+    body += `<p><b>${esc(p.name)}</b> <span class="muted">· ${p.games.length} games in the log</span></p>
+      <form id="pline" class="pform">
+        <label class="field"><span>Stat</span><select id="pstat">${p.stats.map((s) => `<option value="${esc(s.key)}"${s.key === ps.stat ? " selected" : ""}>${esc(s.label)}</option>`).join("")}</select></label>
+        <label class="field"><span>Line</span><input id="pvalue" type="number" step="0.5" value="${esc(ps.line)}" placeholder="e.g. 249.5"></label>
+        <button class="ghost" type="submit">Get chance</button></form>`;
+    if (ps.result) body += playerResult(ps.result);
+  }
+  return `<div class="card" id="pcard"><h2>Player over / under</h2>
+    <p class="muted">Type a player, pick a stat and a line. The chance uses only the player's last 10 games.</p>${form}${body}</div>`;
+}
+function playerResult({ r, label, line }) {
+  if (!r) return `<div class="note warn">Not enough games with a ${esc(label)} number to judge (need at least 3).</div>`;
+  const pct = (p) => `${Math.round(p * 100)}%`;
+  return `<div class="card big" style="margin-top:10px">
+    <div><b>Over ${esc(line)}:</b> ${pct(r.over)} &nbsp; <b>Under:</b> ${pct(r.under)}</div>
+    <div class="muted">${esc(label)}: average ${r.mean.toFixed(1)} over the last ${r.n} games, typical swing ±${r.sd.toFixed(1)}. Last ${r.last.length}: ${r.last.join(", ")}.</div>
+    <p class="muted">Only the recent game log is used. Opponent, injuries, snap counts and game script are not, and this has not been backtested. Treat it as a rough guide.</p></div>`;
+}
+function redrawPlayer() { $("#pcard").outerHTML = playerCard(); wirePlayer(); }
+function wirePlayer() {
+  const find = $("#pfind");
+  if (find) find.onsubmit = async (e) => {
+    e.preventDefault();
+    Object.assign(playerState, { league: $("#pleague").value, query: $("#pname").value.trim(), player: null, result: null, error: "", busy: true });
+    if (playerState.query.length < 3) Object.assign(playerState, { busy: false, error: "Type at least 3 letters of the name." });
+    else {
+      redrawPlayer();
+      try { playerState.player = await findPlayer(playerState.league, playerState.query); playerState.stat = playerState.player.stats[0]?.key || ""; }
+      catch (err) { playerState.error = err.message; }
+      playerState.busy = false;
+    }
+    redrawPlayer();
+  };
+  const line = $("#pline");
+  if (line) line.onsubmit = (e) => {
+    e.preventDefault();
+    const text = $("#pvalue").value.trim();
+    Object.assign(playerState, { stat: $("#pstat").value, line: text, error: "", result: null });
+    if (text === "" || !Number.isFinite(Number(text))) playerState.error = "Type the line, for example 249.5.";
+    else {
+      const value = Number(text), stat = playerState.player.stats.find((s) => s.key === playerState.stat);
+      playerState.result = { r: overUnder(playerState.player.games, playerState.stat, value), label: stat.label, line: value };
+    }
+    redrawPlayer();
+  };
+}
+
 async function pagePredictions() {
   const threshold = settings().edgeThreshold;
   const events = (await Promise.all(["nfl", "nba"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat();
   const preds = await predictionsFor(events);
   const list = events.filter((e) => preds[e.id]);
   const cal = await loadCalibration();
-  if (!list.length) return `<h1>Predictions</h1><div class="empty">No upcoming NFL or NBA games in the next 7 days.</div>`;
+  if (!list.length) return `<h1>Predictions</h1>${playerCard()}<div class="empty">No upcoming NFL or NBA games in the next 7 days.</div>`;
   const sections = ["nfl", "nba"].map((k) => {
     const games = list.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
     if (!games.length) return "";
@@ -476,6 +562,7 @@ async function pagePredictions() {
   return `<h1>Predictions</h1>
     <p class="muted">Statistical estimates from each team's recent points scored and allowed, the starting QB, and home-field advantage. Live games update from the score.</p>
     ${calibrationNote(cal)}
+    ${playerCard()}
     ${sections}`;
 }
 function calibrationNote(cal) {
@@ -828,6 +915,7 @@ function wireView() {
   if (edge) edge.onchange = () => { const v = Math.max(1, Math.min(30, Number(edge.value) || 5)); saveSettings({ ...settings(), edgeThreshold: v }); edge.value = v; };
   const kp = $("#kproxy");
   if (kp) kp.onchange = () => saveSettings({ ...settings(), kalshiProxy: kp.value.trim() });
+  wirePlayer();
 }
 function setUpdated(d) {
   $("#updated").textContent = d ? `Last updated ${new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" }).format(d)}` : "Update failed";

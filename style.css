@@ -68,6 +68,10 @@ svg.wp text { font-size: 12px; fill: var(--muted); }
 .empty { padding: 26px; text-align: center; color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius); }
 label.field { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 input[type="number"], input[type="text"] { font: inherit; padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; width: 110px; background: #fff; }
+select { font: inherit; padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+.pform { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; margin: 10px 0; }
+.pform label.field { flex-direction: column; align-items: flex-start; justify-content: flex-start; border-bottom: 0; padding: 0; gap: 4px; }
+.pform input[type="text"] { width: 240px; }
 .foot { color: var(--muted); font-size: 12px; margin-top: 30px; padding-top: 14px; border-top: 1px solid var(--border); }
 
 /* badges (team abbreviation when a logo is missing) and logos */
