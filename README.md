@@ -1,6 +1,6 @@
 # BananaBets
 
-A personal sports dashboard: scores, stats, odds, Kalshi prices and statistical estimates for NFL, NBA, MLB and UFC.
+A personal sports dashboard: scores, stats, odds, Kalshi prices and statistical estimates for NFL and NBA.
 Research only. It does not connect to any sportsbook and does not place bets.
 
 ## Run it on your computer

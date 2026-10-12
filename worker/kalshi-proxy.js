@@ -4,7 +4,7 @@
 // It never places orders and never holds an account or key.
 //
 // Routes:
-//   /markets?league=nfl|nba|mlb|ufc   open markets: game winners, spreads and totals
+//   /markets?league=nfl|nba   open markets: game winners, spreads and totals
 //   /history?ticker=TICKER&days=N      price history for one market (for the trend chart)
 //
 // Rate limits: answers are cached in Cloudflare's cache (markets 60 s, history 10 min). If Kalshi answers 429
@@ -14,8 +14,6 @@ const KALSHI = "https://api.elections.kalshi.com/trade-api/v2";
 const SERIES = {
   nfl: ["KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL"],
   nba: ["KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL"],
-  mlb: ["KXMLBGAME", "KXMLBSPREAD", "KXMLBTOTAL"],
-  ufc: ["KXUFCFIGHT"],
 };
 const KIND = { GAME: "win", FIGHT: "win", SPREAD: "spread", TOTAL: "total" };
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
@@ -38,13 +36,13 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/markets") return markets(url.searchParams.get("league") || "");
     if (url.pathname === "/history") return history(url.searchParams.get("ticker") || "", Number(url.searchParams.get("days")) || 7);
-    return send({ error: "Use /markets?league=nfl|nba|mlb|ufc or /history?ticker=..." }, 404);
+    return send({ error: "Use /markets?league=nfl|nba or /history?ticker=..." }, 404);
   },
 };
 
 async function markets(league) {
   const series = SERIES[league];
-  if (!series) return send({ error: "Unknown league. Use nfl, nba, mlb or ufc." }, 400);
+  if (!series) return send({ error: "Unknown league. Use nfl or nba." }, 400);
   const freshKey = `https://cache.bananabets/markets/${league}`;
   const staleKey = `https://cache.bananabets/markets-stale/${league}`;
 

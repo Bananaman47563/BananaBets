@@ -7,10 +7,8 @@ const ESPN = "https://site.api.espn.com/apis/site/v2/sports/";
 const LEAGUES = {
   nfl: { path: "football/nfl", name: "NFL", kind: "team", period: 15, length: 60, periods: 4 },
   nba: { path: "basketball/nba", name: "NBA", kind: "team", period: 12, length: 48, periods: 4 },
-  mlb: { path: "baseball/mlb", name: "MLB", kind: "team" },
-  ufc: { path: "mma/ufc", name: "UFC", kind: "fight" },
 };
-const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Network", "TNT", "truTV", "NBA TV", "MLBN", "Netflix"];
+const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Network", "TNT", "truTV", "NBA TV", "Netflix"];
 const TZ = "America/Chicago";
 const SETTINGS_KEY = "bananabets.settings";
 // edgeThreshold: flag when the model and the sportsbook differ by this many points. 10 is what the backtest supports (see scripts/backtest_nfl.py).
@@ -61,10 +59,6 @@ function normalizeEvent(key, e) {
     broadcasts: (comp.broadcasts || []).flatMap((b) => b.names || []),
     headline: (comp.notes || []).map((n) => n.headline).filter(Boolean)[0] || "",
   };
-  if (LEAGUES[key].kind === "fight") {
-    // ESPN lists the card with the main event last, so the last bout is the main event.
-    return { ...base, name: e.name, fights: (e.competitions || []).map(normalizeFight) };
-  }
   const sides = comp.competitors || [];
   const home = sides.find((c) => c.homeAway === "home") || {};
   const away = sides.find((c) => c.homeAway === "away") || {};
@@ -74,7 +68,7 @@ function normalizeEvent(key, e) {
     away: normalizeTeam(away), home: normalizeTeam(home),
     odds: o && {
       provider: (o.provider && o.provider.name) || "",
-      spread: o.spread ?? null,                    // home team's spread (NFL, NBA); MLB uses the run line below
+      spread: o.spread ?? null,                    // home team's spread
       total: o.overUnder ?? null,
       homeML: priceOf(o.moneyline && o.moneyline.home), awayML: priceOf(o.moneyline && o.moneyline.away),
       openHomeML: priceOf(o.moneyline && o.moneyline.home, "open"), openAwayML: priceOf(o.moneyline && o.moneyline.away, "open"),
@@ -82,7 +76,6 @@ function normalizeEvent(key, e) {
       openSpread: lineOf(o.pointSpread && o.pointSpread.home, "open"), openHomeSpreadPrice: priceOf(o.pointSpread && o.pointSpread.home, "open"),
       overPrice: priceOf(o.total && o.total.over), underPrice: priceOf(o.total && o.total.under),
       openTotal: lineOf(o.total && o.total.over, "open"), openOverPrice: priceOf(o.total && o.total.over, "open"),
-      runline: key === "mlb" ? { homeLine: lineOf(o.pointSpread && o.pointSpread.home, "close") } : null,
     },
   };
 }
@@ -109,11 +102,6 @@ function normalizeTeam(c) {
     logo: t.logo || (t.logos && t.logos[0] && t.logos[0].href) || "", logoAlt: t.logoDark || "",
     score: c.score ?? null, record: (c.records || [])[0]?.summary || "", winner: !!c.winner,
   };
-}
-function normalizeFight(c) {
-  const side = (x) => ({ name: x.athlete?.displayName || "TBD", logo: x.athlete?.headshot?.href || "", winner: !!x.winner, record: (x.records || [])[0]?.summary || "" });
-  const f = c.competitors || [];
-  return { id: c.id, a: side(f[0] || {}), b: side(f[1] || {}), state: c.status?.type?.state || "pre", detail: c.status?.type?.shortDetail || "", method: c.status?.type?.description || "", weight: c.type?.text || "" };
 }
 
 /* History files, calibration numbers and the Kalshi proxy (all read-only) */
@@ -170,7 +158,6 @@ function isLive(ev) { return ev.state === "in"; }
 function isCloseLate(ev) {
   if (!isLive(ev) || !ev.home || ev.home.score == null) return false;
   const diff = Math.abs(Number(ev.home.score) - Number(ev.away.score));
-  if (ev.league === "mlb") return ev.period >= 9 && diff <= 1;
   if (ev.league === "nfl" || ev.league === "nba") return ev.period >= 4 && diff <= 8;
   return false;
 }
@@ -204,9 +191,7 @@ function teamCard(ev) {
   const o = ev.odds;
   let lines = `<div class="muted" style="margin-top:8px">No pregame odds listed</div>`;
   if (o) {
-    const spread = ev.league === "mlb" && o.runline
-      ? `Run line <b>${esc(h.abbr)} ${signedNum(o.runline.homeLine)}</b>`
-      : `Spread <b>${esc(h.abbr)} ${signedNum(o.spread)}</b>`;
+    const spread = `Spread <b>${esc(h.abbr)} ${signedNum(o.spread)}</b>`;
     lines = `<div class="lines"><span>${spread}</span><span>Total <b>${esc(o.total ?? "—")}</b></span>
       <span>ML <b>${esc(american(o.awayML))} / ${esc(american(o.homeML))}</b></span><span class="muted">${esc(o.provider)}</span></div>`;
   }
@@ -215,19 +200,6 @@ function teamCard(ev) {
     <div class="kicker"><span>${esc(LEAGUES[ev.league].name)}${ev.playoff ? " · Playoffs" : ""}${ev.preseason ? " · Preseason" : ""}</span>${statusChip(ev)}</div>
     ${ev.headline ? `<div class="muted">${esc(ev.headline)}</div>` : ""}
     <div class="teams">${row(a)}${row(h)}</div>${lines}</a>`;
-}
-function fightCard(ev) {
-  const fights = ev.fights || [];
-  const main = fights[fights.length - 1];                // last bout on ESPN's card is the main event
-  return `<div class="card ${isLive(ev) ? "live" : ""}">
-    <div class="kicker"><span>UFC · ${esc(ev.name)}</span>${isLive(ev) ? `<span class="chip live">LIVE</span>` : ""}</div>
-    ${main ? `<div class="muted">Main event</div>${fightRow(main)}` : `<div class="muted">No fights listed.</div>`}
-    <div class="muted" style="margin-top:8px">${esc(fmtTime(ev.date))} · ${fights.length} bouts · ${ev.completed ? "event complete" : "upcoming"}</div></div>`;
-}
-function fightRow(f) {
-  const side = (x) => `<div class="team ${x.winner ? "winner" : (f.state === "post" && !x.winner ? "loser" : "")}">
-    ${x.logo ? `<img class="logo" src="${esc(x.logo)}" alt="" loading="lazy">` : `<span class="badge">UFC</span>`}<div><div class="name">${esc(x.name)}</div><div class="muted">${esc(x.record)}</div></div><span></span></div>`;
-  return `<div class="teams">${side(f.a)}${side(f.b)}</div><div class="muted" style="margin-top:6px">${esc(f.weight)}${f.method ? ` · ${esc(f.method)}` : ""} ${f.detail ? `· ${esc(f.detail)}` : ""}</div>`;
 }
 
 /* ---------- pages: Home, leagues, game ---------- */
@@ -238,25 +210,19 @@ async function pageHome() {
   const primetime = teamEvents.filter((e) => !e.playoff && !e.preseason && !e.completed
     && e.broadcasts.some((b) => NATIONAL_NETWORKS.some((n) => b.includes(n))) && centralHour(e.date) >= 18);
   const close = teamEvents.filter(isCloseLate);
-  const ufc = all.filter((e) => e.league === "ufc").slice(0, 1);
   const section = (title, items, render) => items.length ? `<h2>${title}</h2><div class="grid two">${items.map(render).join("")}</div>` : "";
   const html = [
     section("Live and close late", close, teamCard),
     section("Playoffs", playoffs, teamCard),
     section("Primetime national TV", primetime.slice(0, 6), teamCard),
-    section("UFC main event", ufc, fightCard),
   ].join("");
-  return `<h1>Big games</h1><p class="muted">Playoffs, primetime national TV (regular season only), the UFC main event, and live games close late. The primetime test uses a list of national networks and an evening Central start; it's approximate.</p>
+  return `<h1>Big games</h1><p class="muted">Playoffs, primetime national TV (regular season only), and live games close late. The primetime test uses a list of national networks and an evening Central start; it's approximate.</p>
     ${html || `<div class="empty">Nothing big right now. Check the league tabs for today's games.</div>`}`;
 }
 
 async function pageLeague(key) {
   const meta = LEAGUES[key];
   const events = await scoreboard(key, { week: true });
-  if (meta.kind === "fight") {
-    if (!events.length) return `<h1>UFC</h1><div class="empty">No UFC events listed by ESPN right now.</div>`;
-    return `<h1>UFC</h1><p class="muted">Cards from ESPN. Win odds for fights aren't in ESPN's public feed yet.</p><div class="grid">${events.map(fightCard).join("")}</div>`;
-  }
   if (!events.length) return `<h1>${meta.name}</h1><div class="empty">No ${meta.name} games listed for the next 7 days.</div>`;
   const byDay = {};
   for (const e of events) (byDay[dayKey(new Date(e.date))] ||= []).push(e);
@@ -270,7 +236,6 @@ async function pageLeague(key) {
 
 async function pageGame(key, id) {
   const meta = LEAGUES[key];
-  if (meta.kind === "fight") return `<h1>UFC bout</h1><p class="muted">Bout details (rounds, method, strikes) aren't wired up yet. See the event card on the UFC tab.</p>`;
   const s = await summary(key, id);
   const header = (s.header?.competitions || [])[0] || {};
   const comps = header.competitors || [];
@@ -614,7 +579,7 @@ function whyHtml(ev, p) {
 }
 
 /* ---------- Markets: game-by-game Yes/No rows, with Kalshi when connected ---------- */
-const KALSHI_LEAGUES = ["nfl", "nba", "mlb"];
+const KALSHI_LEAGUES = ["nfl", "nba"];
 function nameMatch(outcome, teamName) {
   return !!outcome && teamName.toLowerCase().includes(outcome.toLowerCase());
 }
@@ -745,11 +710,11 @@ function gameMarkets(ev, p, kalshiMs) {
     label: `${away} win`, sub: ev.away.abbr, kalshi: kFor("away"), book: ab,
     bb: p ? 1 - p.pct : null, trendTicker: kFor("away") && kFor("away").ticker,
   }));
-  // Spread (home line; MLB uses the run line)
-  const L = ev.league === "mlb" && o && o.runline ? o.runline.homeLine : (o ? o.spread : null);
+  // Spread (home line)
+  const L = o ? o.spread : null;
   if (L != null && o) {
     const sp = noVig2(o.homeSpreadPrice, o.awaySpreadPrice);
-    const homeCover = p ? phi((p.margin + L) / p.sigma) : (ev.league === "mlb" ? null : null);
+    const homeCover = p ? phi((p.margin + L) / p.sigma) : null;
     const kh = nearestKalshi(kSpread, "spread", L, "home", ev);
     const ka = nearestKalshi(kSpread, "spread", -L, "away", ev);
     const mvOpen = o.openSpread;
@@ -786,7 +751,7 @@ function gameMarkets(ev, p, kalshiMs) {
 let marketsShowAll = false;
 const SOON_MS = 3 * 3600 * 1000;
 async function pageMarkets() {
-  const events = (await Promise.all(["nfl", "nba", "mlb"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat()
+  const events = (await Promise.all(["nfl", "nba"].map((k) => scoreboard(k, { week: true }).catch(() => [])))).flat()
     .filter((e) => !e.completed && !e.preseason && e.odds);
   const now = Date.now();
   const inWindow = (e) => isLive(e) || (Date.parse(e.date) >= now - 60000 && Date.parse(e.date) <= now + SOON_MS);
@@ -808,7 +773,7 @@ async function pageMarkets() {
     : `<p class="muted">Showing live games and games starting in the next 3 hours (${shown.length}).</p>`;
   const toggle = `<div class="row" style="margin:10px 0"><button id="showAllBtn" class="secondary" type="button">${marketsShowAll ? "Show only the next 3 hours" : "Show all this week"}</button>
     ${marketsShowAll ? "" : `<span class="muted">Fetches Kalshi prices for the rest of the week.</span>`}</div>`;
-  const byLeague = ["nfl", "nba", "mlb"].map((k) => {
+  const byLeague = ["nfl", "nba"].map((k) => {
     const list = shown.filter((e) => e.league === k).sort((a, b) => a.date.localeCompare(b.date));
     if (!list.length) return "";
     return `<h2>${LEAGUES[k].name}</h2><div class="grid two">${list.map((e) => `
@@ -819,7 +784,7 @@ async function pageMarkets() {
       </div>`).join("")}</div>`;
   }).join("");
   return `<h1>Markets</h1>
-    <p class="muted">Yes/No prices for each game: winner, spread and total. Sportsbook prices have the vig removed. BananaBets uses the model where it covers the league (NFL and NBA; MLB is not modelled yet).</p>
+    <p class="muted">Yes/No prices for each game: winner, spread and total. Sportsbook prices have the vig removed. BananaBets uses the model for NFL and NBA.</p>
     ${windowLine}
     ${toggle}
     ${kalshiNote}
@@ -866,7 +831,7 @@ function pageSettings() {
 /* ---------- router and refresh ---------- */
 const ROUTES = {
   home: () => pageHome(),
-  nfl: () => pageLeague("nfl"), nba: () => pageLeague("nba"), mlb: () => pageLeague("mlb"), ufc: () => pageLeague("ufc"),
+  nfl: () => pageLeague("nfl"), nba: () => pageLeague("nba"),
   markets: () => pageMarkets(), predictions: () => pagePredictions(), record: () => pageRecord(), settings: () => pageSettings(),
 };
 function currentRoute() { return (location.hash.replace(/^#\/?/, "") || "").split("/").filter(Boolean); }
