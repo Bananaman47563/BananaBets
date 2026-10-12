@@ -14,7 +14,7 @@ const NATIONAL_NETWORKS = ["ESPN", "ABC", "NBC", "FOX", "CBS", "Prime", "NFL Net
 const TZ = "America/Chicago";
 const SETTINGS_KEY = "bananabets.settings";
 // edgeThreshold: flag when the model and the sportsbook differ by this many points. 10 is what the backtest supports (see scripts/backtest_nfl.py).
-const DEFAULTS = { edgeThreshold: 10, kalshiProxy: "" };   // kalshiProxy: address of your Cloudflare Worker (worker/SETUP.md)
+const DEFAULTS = { edgeThreshold: 10, kalshiProxy: "https://bananabets-kalshi.tmanrat2007.workers.dev" };   // kalshiProxy: address of your Cloudflare Worker (worker/SETUP.md)
 
 const cache = new Map();                                    // url -> { at, data }; avoids duplicate requests
 async function getJSON(url, { maxAgeMs = 10000 } = {}) {
@@ -132,7 +132,7 @@ async function loadCalibration() {
   if (!calibrationCache) calibrationCache = fetch("data/calibration.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
   return calibrationCache;
 }
-const kalshiProxy = () => (settings().kalshiProxy || "").trim().replace(/\/+$/, "");
+const kalshiProxy = () => (settings().kalshiProxy || DEFAULTS.kalshiProxy).trim().replace(/\/+$/, "");   // a blank saved value falls back to the built-in address
 async function kalshiMarkets(key) {
   return getJSON(`${kalshiProxy()}/markets?league=${key}`, { maxAgeMs: 55000 });
 }
